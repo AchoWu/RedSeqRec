@@ -281,8 +281,8 @@ class REDRec(BaseModel):
             self.position_embeddings = nn.Embedding(200, self.projection_dim)
 
         if self.use_precomputed_embedding:
-            # 512 -> 1536
-            # 使用 mlp 生维对齐 qb embedding
+            # 使用 mlp 升维对齐 qb embedding
+            # 512 -> 1536（qb embedding dim）
             self.input_embedding_projector = nn.Sequential(
                 nn.Linear(self.precomputed_input_dim, self.projection_dim),
                 nn.GELU(),
@@ -502,6 +502,7 @@ class REDRec(BaseModel):
         user_feats = self.input_embedding_projector(input_embeds)
 
         if self.query_nums > 0:
+            # 拼接 self.query_nums 个 learnable query token 到末尾
             batch_size = user_feats.shape[0]
             query_embedding = self.query(torch.arange(self.query_nums, device=user_feats.device))
             user_feats = torch.cat([user_feats, query_embedding.unsqueeze(0).repeat(batch_size, 1, 1)], dim=1)

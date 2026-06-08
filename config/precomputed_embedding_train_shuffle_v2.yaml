@@ -72,10 +72,16 @@ model:
   user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
   user_llm_init: true
   precomputed_input_dim: 512
-  # User-tower intermediate output dim. Kept at 64 (the safe value that does
-  # NOT trigger SIGFPE during backward through note_embedding_head).
-  # A lightweight output_mlp then lifts 64 -> 512 for NCE loss & eval.
-  user_output_dim: 64
+  # User-tower intermediate output dim. Set equal to user_final_dim (512) so
+  # note_embedding_head outputs 1536 -> 512 directly, and output_mlp degrades
+  # to nn.Identity (see redrec.py:236-244). This removes the 64-d bottleneck
+  # of the previous 1536 -> 64 -> 512 path: same param budget, ~8x more
+  # representational capacity for NCE retrieval over 4096 global negs.
+  # NOTE: the older value (64) was a workaround for a cuBLAS Lt SIGFPE
+  # observed during stage-2 backward through note_embedding_head when this
+  # dim > 64. The Red-Mmu-Rec parent ckpt was trained at 512 without that
+  # crash, so 512 should be safe here; revert to 64 if SIGFPE reproduces.
+  user_output_dim: 512
   # Final user embedding dim after output_mlp. Must equal 512 to match the
   # precomputed item embedding pool used for training (NCE) and eval (recall).
   user_final_dim: 512
