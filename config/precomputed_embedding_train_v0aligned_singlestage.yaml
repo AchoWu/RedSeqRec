@@ -1,0 +1,181 @@
+# ===================================================================
+# V0-aligned SINGLE-STAGE training config.
+#
+# Goal: maximally reuse the OFFICIAL demo_singlescene.yaml setup
+#   - end-to-end (NO freeze_prefix; user_llm is trainable)
+#   - ZeRO stage 3
+#   - gradient_checkpointing: true
+#   - bf16-mixed
+#   - load from the official Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b ckpt
+#     (already stripped to be shape-compatible with output_dim=512 /
+#      query_nums=1 by scripts/strip_incompatible_pretrained_keys.py)
+#
+# Differences vs official demo_singlescene.yaml are limited to data:
+#   - dataset_type: v0_aligned   (use our cleaned XHS V0 protocol)
+#   - precomputed memmap embeddings + JSONL user histories.
+# Everything else (model arch, optim, ZeRO, ckpt) is intentionally kept
+# identical to the official setup so that, if step-1 backward still hits
+# SIGFPE, we can confidently attribute the crash to the cluster's
+# CUDA / cuBLAS environment (NOT to our code or two-stage protocol).
+# ===================================================================
+
+data:
+  dataset_type: v0_aligned
+
+  v0_train_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  v0_eval_jsonl:  /apdcephfs_gy4/share_303218624/jingweidong/user_last/test.shuffled.jsonl
+  v0_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+
+  seq_label: seq
+  positive_label: pos
+  hard_neg_label: []
+  max_hard_neg: 0
+  min_history_len: 4
+  max_seq_len: 200
+  sample_lastn: true
+  train_target_strategy: random
+  loop_forever: true
+  shuffle_buffer_size: 1024
+
+  eval_users: 50000
+  eval_target_strategy: all
+  eval_seed: 42
+
+  # Single-stage starts from the OFFICIAL ckpt (already trained on the
+  # original task), so we don't need stage-1's ultra-large bs=96 adapter
+  # warmup. Keep the conservative bs that stage-2 used (24/GPU).
+  # If first-step backward succeeds and memory is comfortable, you may
+  # raise to 32 later.
+  train_batch_size: 24
+  neg_samples_per_gpu: 400
+  neg_pool_size_per_gpu: 1000000
+
+  train_num_workers: 8
+  precomputed_stats_interval: 10000
+
+  # ---- legacy fields kept so existing code paths don't crash ----
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  # ALIGNED WITH OFFICIAL demo_singlescene.yaml.
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # === Aligned with V0Simple. MUST match the cleaned aligned512 ckpt
+  # produced by scripts/strip_incompatible_pretrained_keys.py. ===
+  user_output_dim: 512
+  query_nums: 1
+  window_pos: 1
+
+# Single-stage: NOTHING frozen. End-to-end, identical to official.
+# (Do NOT set freeze_prefix here.)
+
+training:
+  target: homefeed
+  optim_args:
+    # Single small lr for the whole model: official demo uses 1e-5 too.
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    # 10x lr for the adapter modules (input embedding projector & note
+    # embedding head): they are randomly initialized w.r.t. the new
+    # output_dim=512 and need a steeper landscape than the warm Qwen
+    # trunk. This matches the lr_mult convention used in the official
+    # demo_singlescene.yaml (which 5x's latent_proj_*).
+    lr_mult_prefix:
+      - 'input_embedding_projector'
+      - 'note_embedding_head'
+    lr_mult_rate: 10.0
+
+  scheduler_args:
+    type: cosine
+    # ~2% of total_step: gentle warmup so the freshly-init adapter heads
+    # don't blow up the well-trained Qwen trunk in the first few hundred
+    # steps.
+    warmup_steps: 600
+
+  # V0Simple cadence: log/eval every 1000 steps.
+  eval_step: 1000
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+  save_step: 2000
+  ckpt_keep_top_k: 5
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+
+  total_step: 30000
+  strategy: deepspeed
+  # ZeRO Stage 3: shard params + grads + optim state across ranks.
+  # Aligned with official demo_singlescene.yaml.
+  stage: 3
+  gradient_checkpointing: true
+
+  # CLEANED official ckpt (output_dim=512 / query_nums=1 keys stripped
+  # to fall back to random init -> compatible with our model arch).
+  load_pretrained_model: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/pytorch_model.aligned512.bin
+
+saver:
+  # ===================================================================
+  # V0-aligned output layout: run.py rewrites these at startup so all
+  # per-run artifacts land under
+  #   <output_dir>/v0aligned_singlestage_<YYYYMMDD_HHMMSS>/
+  #     ├── tb/  ├── checkpoint-<step>/  ├── train_config_<ts>.json
+  #     └── logger/<inner_ts>.log
+  # ===================================================================
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  v0_style: true
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  saved_model_name: v0aligned_singlestage
+
+eval:
+  target: homefeed
+  # Replace <RUN_TS> with the actual run subdir before launching eval.
+  model_path: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/v0aligned_singlestage_<RUN_TS>/checkpoint-20001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 200
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 10
+reproducibility: false

@@ -1,0 +1,183 @@
+data:
+  # ===================================================================
+  # V0-aligned stage 2: full backbone fine-tune. See stage1 yaml for the
+  # data-protocol details (input=seq, target=pos, V0 memmap embedding).
+  # ===================================================================
+  dataset_type: v0_aligned
+
+  v0_train_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  v0_eval_jsonl:  /apdcephfs_gy4/share_303218624/jingweidong/user_last/test.shuffled.jsonl
+  v0_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+
+  seq_label: seq
+  positive_label: pos
+  hard_neg_label: []
+  max_hard_neg: 0
+  min_history_len: 4
+  max_seq_len: 200
+  sample_lastn: true
+  train_target_strategy: random
+  loop_forever: true
+  shuffle_buffer_size: 1024
+
+  eval_users: 50000
+  eval_target_strategy: all
+  eval_seed: 42
+
+  # Stage 2: user_llm unfrozen, full backward + grad ckpt. 8x H20 (96GB).
+  # max_seq_len=200 (was 96 in xhs default) -> compute roughly 2x; we drop
+  # bs/gpu from 32 to 24 to leave headroom. If this OOMs on your cluster
+  # specifically, try 16. Effective in-batch neg = 24*8 - 1 = 191.
+  # Plus global random neg = 400*8 = 3200 -> ~3391 negs per user.
+  train_batch_size: 24
+  neg_samples_per_gpu: 400
+  neg_pool_size_per_gpu: 1000000
+
+  train_num_workers: 8
+  precomputed_stats_interval: 10000
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # === Aligned with V0Simple ===
+  user_output_dim: 512
+  query_nums: 1
+  window_pos: 1
+
+# Stage 2: nothing frozen.
+# (Do NOT set freeze_prefix here.)
+
+training:
+  target: homefeed
+  optim_args:
+    # Backbone lr: small to preserve well-warmed-up adapter from stage 1
+    # and to gently fine-tune Qwen2.5-1.5B.
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    # 10x lr for adapter modules (their loss landscape is steeper than LLM trunk).
+    lr_mult_prefix:
+      - 'input_embedding_projector'
+      - 'note_embedding_head'
+    lr_mult_rate: 10.0
+
+  scheduler_args:
+    type: cosine
+    # ~2% of total_step. Stage-2 starts from a warm adapter (stage-1 result)
+    # but unfreezes the 1.5B Qwen trunk for the first time, so we keep a
+    # non-trivial warmup to avoid clobbering the pretrained features when
+    # peer-rank gradients first arrive.
+    warmup_steps: 600
+
+  # Log/eval every 1000 steps (V0Simple cadence).
+  eval_step: 1000
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+  # Save every 2000 steps (15 ckpts in 30k-step run). With keep_top_k=5
+  # below, only the best 5 by online recall (+ the final ckpt) are kept on
+  # disk; the rest are pruned automatically.
+  save_step: 2000
+  # Keep only the best 5 ckpts by online eval top10_recall (the final-step
+  # ckpt is preserved unconditionally regardless of metric).
+  ckpt_keep_top_k: 5
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  # 30000 steps * (24 * 8) = ~5.8M samples seen. Note this is much less than
+  # V0's 245.8M (60k * 4096) because:
+  #   1) we start from a warm adapter (stage-1) instead of random init;
+  #   2) Qwen2.5-1.5B is ~75x larger than V0's 6-layer Transformer, so
+  #      sample efficiency is much higher per step.
+  # Eval cadence is 1000 steps -> 30 datapoints to draw a clean recall
+  # curve. If recall is still climbing at step 25k+, raise to 50k-60k
+  # (analogous to V0's '20k under-fit -> 60k' lesson). If it plateaus by
+  # step 15k, you can stop early.
+  total_step: 30000
+  strategy: deepspeed
+  # ZeRO Stage 2: shard optimizer state + gradients (NOT params). For
+  # Qwen2.5-1.5B with bf16-mixed and AdamW, per-rank model-state cost is
+  #   params(bf16)        =  3.0 GB  (replicated)
+  #   master fp32 params  =  6.0 GB  (replicated)
+  #   gradients (fp32/W)  =  6.0/8 = 0.75 GB
+  #   AdamW m+v (fp32/W)  = 12.0/8 = 1.5  GB
+  #   TOTAL per-rank      ≈ ~11 GB
+  # Plus activations (~15-20GB with grad_ckpt + max_seq=200, bs=24) and
+  # workspace (~3GB) -> ~30-35GB / GPU. H20 has 96GB. Comm is much lighter
+  # than Stage 3 (no per-layer param all-gather/release each step), so we
+  # expect ~30-50% wall-clock speedup over the original 20k-step plan.
+  stage: 2
+  gradient_checkpointing: true
+  # Load stage-1 adapter-warmed ckpt (deepspeed zero ckpt directory).
+  # IMPORTANT: with v0_style, stage 1 writes to
+  #   <output_dir>/v0aligned_stage1_adapter_<YYYYMMDD_HHMMSS>/checkpoint-<step>/
+  # so you MUST replace <RUN_TS> below with the actual stage-1 run timestamp
+  # before launching stage 2.
+  load_pretrained_model: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/v0aligned_stage1_adapter_<RUN_TS>/checkpoint-2001/
+
+saver:
+  # ===================================================================
+  # V0-aligned output layout (see stage 1 yaml for full description).
+  # All per-run artifacts go to:
+  #   <output_dir>/v0aligned_stage2_joint_<YYYYMMDD_HHMMSS>/
+  #     ├── tb/  ├── checkpoint-<step>/  ├── train_config_<ts>.json
+  #     └── logger/<inner_ts>.log
+  # ===================================================================
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  v0_style: true
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  saved_model_name: v0aligned_stage2_joint
+
+eval:
+  target: homefeed
+  # See stage 1 yaml note: replace <RUN_TS> with the actual run subdir.
+  model_path: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/v0aligned_stage2_joint_<RUN_TS>/checkpoint-20001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 200
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 10
+reproducibility: false

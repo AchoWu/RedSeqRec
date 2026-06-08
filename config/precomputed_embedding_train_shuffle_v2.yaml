@@ -1,0 +1,177 @@
+data:
+  dataset_type: precomputed_embedding
+  # Train jsonl: pre-shuffled V0-style file (history items carry seq / pos / hardneg labels).
+  precomputed_user_history_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  # Memmap embedding dir (cids.npy + embeddings.bin + meta.json), 3.25M items, 512-dim.
+  precomputed_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+
+  # ---- training target / input strategy ----
+  # 'pos_random_seq_input' = input <- items with label=='seq', target <- random
+  # one of items with label=='pos'. Designed for the V0-style jsonl above.
+  simple_target_strategy: pos_random_seq_input
+  precomputed_positive_label: pos
+  precomputed_input_seq_label: seq
+  precomputed_sample_lastn: true
+  precomputed_min_history_len: 4
+  precomputed_loop_forever: true
+  precomputed_max_lines: null
+  precomputed_stats_interval: 10000
+
+  # ---- v0-aligned online eval block ----
+  # Aligned with the v0 reference run
+  # (/apdcephfs_gy4/share_303218624/jingweidong/output/logs/nohup_20260602_114853.log)
+  # so the user set + recall metrics are directly comparable:
+  #   * v0_eval_jsonl: same test.shuffled.jsonl
+  #   * eval_users=50000, stride = total_lines // eval_users = 200000/50000 = 4,
+  #     i.e. line_no in {0, 4, 8, ...}, exactly the same 50k users as v0.
+  #   * eval_target_strategy='all': for each user emit one eval sample per pos,
+  #     yielding the same ~612309 eval samples as the v0 reference run.
+  # NOTE on max_seq_len: kept at 200 to fully match the v0 reference run
+  # (same eval samples, same input length used for redrec user embedding,
+  # same user pool). This also dictates the train-time history length, so
+  # train_batch_size below has been halved from 64 -> 32 to absorb the
+  # ~2x KV-cache footprint per sequence.
+  v0_eval_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/test.shuffled.jsonl
+  seq_label: seq
+  positive_label: pos
+  eval_users: 50000
+  eval_target_strategy: all
+  max_seq_len: 200
+  min_history_len: 4
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  # ---- batching / negatives ----
+  # bs=32 (halved from 64) to absorb the ~2x KV-cache footprint of
+  # max_seq_len=200 (vs 96 previously). Per-step user count remains
+  # 32 * 8 = 256 across 8 GPUs.
+  train_batch_size: 32
+  # Global neg pool target = 4096; per-GPU = 4096 / world_size (=8) = 512.
+  # The model's forward_precomputed_embedding all-gathers neg_emb across ranks,
+  # so effective negatives = neg_samples_per_gpu * world_size.
+  neg_samples_per_gpu: 512
+  neg_pool_size_per_gpu: 1000000
+
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+  train_num_workers: 8
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  # User-tower intermediate output dim. Kept at 64 (the safe value that does
+  # NOT trigger SIGFPE during backward through note_embedding_head).
+  # A lightweight output_mlp then lifts 64 -> 512 for NCE loss & eval.
+  user_output_dim: 64
+  # Final user embedding dim after output_mlp. Must equal 512 to match the
+  # precomputed item embedding pool used for training (NCE) and eval (recall).
+  user_final_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # Single-query, single-target retrieval.
+  window_pos: 1
+  query_nums: 1
+
+training:
+  target: homefeed
+  optim_args:
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    lr_mult_prefix:
+      - 'input_embedding_projector'
+    lr_mult_rate: 10.0
+
+  scheduler_args:
+    type: cosine
+    warmup_steps: 400
+
+  # Online recall eval cadence (uses test.shuffled.jsonl + the same memmap pool).
+  # Every 1000 steps: run v0-aligned eval (top1/50/100/500 vs mean_pool /
+  # last_pool / last8_pool / last32_pool) AND save a deepspeed ckpt; the
+  # top-K pruner keeps only the 5 ckpts with the highest redrec.top500_recall
+  # (final-step ckpt is always preserved regardless of metric).
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+
+  # ckpt cadence aligned to eval cadence so the saved ckpt is associated with
+  # its own eval metric.
+  eval_step: 1000
+  save_step: 1000
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  total_step: 50000
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: true
+  # 512-dim aligned weights (note_embedding_head + query stripped, output_dim=512).
+  load_pretrained_model: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/pytorch_model.bin
+
+saver:
+  # ----- V0-style per-run output layout -----
+  # When v0_style: true, run.py rewrites saver.checkpoint_dir / log_dir /
+  # saved_model_name into <output_dir>/<saved_model_name>_<TS>/, so each
+  # run lands under a fresh timestamped sub-directory and produces:
+  #   <output_dir>/<saved_model_name>_<TS>/
+  #     ├── checkpoint-<step>/   (DeepSpeed sharded ckpts)
+  #     ├── tb/                  (tensorboard events)
+  #     ├── logger/<TS>.log      (Python logging output)
+  #     └── train_config_<TS>.json
+  v0_style: true
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  # These two get rewritten by _resolve_v0_style_paths(); kept as fallback
+  # for non-v0_style runs.
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  saved_model_name: precomputed_shuffle_user_tower_v2
+
+eval:
+  target: homefeed
+  model_path: expr/precomputed_shuffle_user_tower_v2/checkpoint-20001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 96
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false

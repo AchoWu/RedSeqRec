@@ -121,3 +121,65 @@ eval/user_lastn.json
 eval/user_to_target_info.json
 
 bak/
+
+
+# ===== 大数据 / 训练产物 =====
+embedding/
+expr/
+logs/
+__pycache__/
+
+# ===== eval/ 只保留脚本，其他全 ignore =====
+eval/*
+!eval/*.py
+!eval/*.sh
+!eval/*.md
+!eval/.gitignore
+
+# ===== Python =====
+*.py[cod]
+*$py.class
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# ===== 日志 =====
+*.log
+*.out
+*.err
+
+# ===== 模型 / 数据兜底 =====
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+*.bin
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+*.arrow
+*.feather
+*.tfrecord
+*.tfrecords
+*.gz
+*.zip
+*.tar
+*.tgz
+*.bz2
+*.7z
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

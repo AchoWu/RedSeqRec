@@ -9,11 +9,13 @@
 # This modified file is released under the same license.
 
 import os
+import shutil
 import sys
 from logging import getLogger
 from time import time
 import time as t
 import torch
+import torch.distributed as dist
 import torch.optim as optim
 from tqdm import tqdm
 import deepspeed
@@ -55,7 +57,17 @@ class Trainer(object):
             ensure_dir(self.log_save_root)
 
             # tensorboard
-            tensorboard_base_root = os.path.join(self.log_save_root, 'tensorboard', t.strftime('%Y-%m-%d %H:%M:%S', t.localtime(t.time())))
+            # When saver.v0_style is on, the per-run subdir already carries a
+            # timestamp suffix (e.g. ``v0aligned_stage1_adapter_<ts>``), so we
+            # drop the inner per-launch ts and use the V0-canonical ``tb/``
+            # name. Otherwise keep the legacy nested-timestamp layout.
+            if config.saver.get('v0_style', False):
+                tensorboard_base_root = os.path.join(self.log_save_root, 'tb')
+            else:
+                tensorboard_base_root = os.path.join(
+                    self.log_save_root, 'tensorboard',
+                    t.strftime('%Y-%m-%d %H:%M:%S', t.localtime(t.time())),
+                )
             if not os.path.exists(tensorboard_base_root):
                 os.makedirs(tensorboard_base_root)
             from tensorboardX import SummaryWriter
@@ -66,6 +78,29 @@ class Trainer(object):
         self.cur_step = 0
         self.total_step = config.training.get('total_step', 200000)
         self.train_loss_dict = dict()
+
+        # ---------------- V0-aligned online eval state ----------------
+        # Enabled whenever ``eval_interval > 0``. Originally guarded by
+        # ``dataset_type == 'v0_aligned'``; relaxed so the precomputed-
+        # embedding (gold) path can also reuse the same recall-eval pipeline.
+        # The eval pack is built lazily on each rank in fit(); each rank reads
+        # its own pack via the shared OS page cache (cheap for memmap-backed
+        # embeddings).
+        # ckpt_top_k: keep only the K best checkpoints by ``redrec.top500_recall``.
+        # The 'final' end-of-training ckpt is NEVER pruned regardless of metric.
+        self._v0_eval_enabled = (
+            int(config.training.get('eval_interval', 0)) > 0
+        )
+        self._v0_eval_interval = int(config.training.get('eval_interval', 0))
+        self._v0_eval_pack = None
+        # List of (top500_recall: float, ckpt_dir: str). After every eval-driven
+        # save, we sort by recall desc and prune everything past the top-K.
+        # Only ``self.rank == 0`` mutates this list and performs file deletion.
+        self._ckpt_top_k = int(config.training.get('ckpt_keep_top_k', 0))
+        self._ckpt_records = []  # rank-0 only; (top500_recall, ckpt_dir)
+        # Cache of zero-param baselines (mean_pool / last_pool); they don't
+        # change across training steps so we evaluate them only once.
+        self._v0_baseline_cache = None
         
         # frozen
         if config.get('freeze_prefix', None) or config.get('freeze_ad', None):
@@ -216,8 +251,14 @@ class Trainer(object):
                     nce_top1_acc = model_out['nce_top1_acc']
                     nce_top10_acc = model_out['nce_top10_acc']
                     nce_top100_acc = model_out['nce_top100_acc']
-    
-                    msg = f"{self.cur_step} / {self.total_step} | loss: {losses:.4f}, lr: {cur_step_lr:.7f}, data_cost: {(data_time - start_time):.2f}, forward_cost: {(fwd_time - data_time):.3f}, bwd: {(bwd_time - fwd_time):.3f}, elapse: {elapse:.4f}, top1_acc: {nce_top1_acc.item():.4f}, top10_acc: {nce_top10_acc.item():.4f}, top100_acc: {nce_top100_acc.item():.4f}"
+                    # Extended metrics aligned with V0Simple baseline; .get() to be
+                    # forward-compatible with old logits widths where 50/500 may be skipped.
+                    nce_top50_acc = model_out.get('nce_top50_acc', None)
+                    nce_top500_acc = model_out.get('nce_top500_acc', None)
+                    top50_str = f"{nce_top50_acc.item():.4f}" if nce_top50_acc is not None else 'NA'
+                    top500_str = f"{nce_top500_acc.item():.4f}" if nce_top500_acc is not None else 'NA'
+
+                    msg = f"{self.cur_step} / {self.total_step} | loss: {losses:.4f}, lr: {cur_step_lr:.7f}, data_cost: {(data_time - start_time):.2f}, forward_cost: {(fwd_time - data_time):.3f}, bwd: {(bwd_time - fwd_time):.3f}, elapse: {elapse:.4f}, top1_acc: {nce_top1_acc.item():.4f}, top10_acc: {nce_top10_acc.item():.4f}, top50_acc: {top50_str}, top100_acc: {nce_top100_acc.item():.4f}, top500_acc: {top500_str}"
                     
                     # TensorBoard logging
                     if self.rank == 0:
@@ -229,6 +270,10 @@ class Trainer(object):
                         self.tensorboad_writer.add_scalar('nce_top1_acc', nce_top1_acc.item(), self.cur_step)
                         self.tensorboad_writer.add_scalar('nce_top10_acc', nce_top10_acc.item(), self.cur_step)
                         self.tensorboad_writer.add_scalar('nce_top100_acc', nce_top100_acc.item(), self.cur_step)
+                        if nce_top50_acc is not None:
+                            self.tensorboad_writer.add_scalar('nce_top50_acc', nce_top50_acc.item(), self.cur_step)
+                        if nce_top500_acc is not None:
+                            self.tensorboad_writer.add_scalar('nce_top500_acc', nce_top500_acc.item(), self.cur_step)
                         
                         # if model_out['ae_decay'] > 0:
                         #     self.tensorboad_writer.add_scalar('ae_decay', model_out['ae_decay'], self.cur_step)
@@ -241,10 +286,32 @@ class Trainer(object):
                     self.logger.info(msg)
                     self.logger.info("\n" + "-"*50)
                 
-                # Save model
-                if self.cur_step % self.config.training.eval_step == 0:
-                    self._save_checkpoint()
-                    
+                # ---- v0-aligned online eval (every eval_interval steps) ----
+                # Run BEFORE saving so that the freshly-saved ckpt is associated
+                # with its own eval metric for the top-K pruner.
+                latest_top500 = None
+                if self._v0_eval_enabled and self.cur_step % self._v0_eval_interval == 0:
+                    latest_top500 = self._run_v0_eval()
+
+                # Save model. We prefer `save_step` (dedicated to checkpointing)
+                # and fall back to `eval_step` for backward compatibility. This
+                # lets us decouple "log-cadence/online-eval cadence" from
+                # "checkpoint cadence" (e.g. log every 1000 steps but only save
+                # every 5000 steps to save disk).
+                _save_step = int(self.config.training.get('save_step', self.config.training.eval_step))
+                if self.cur_step % _save_step == 0:
+                    saved_dir = self._save_checkpoint()
+                    # If we have a fresh eval result, register this ckpt for
+                    # top-K pruning. ckpts produced when no eval ran in the
+                    # same step are kept as-is (they survive pruning forever).
+                    if (
+                        self.rank == 0
+                        and self._ckpt_top_k > 0
+                            and latest_top500 is not None
+                        and saved_dir is not None
+                    ):
+                            self._register_and_prune_ckpts(saved_dir, latest_top500)
+
                 if self.cur_step == self.total_step:
                     break
             else:
@@ -270,6 +337,9 @@ class Trainer(object):
         Args:
             epoch (int): the current epoch id
 
+        Returns:
+            str: the path of the directory we just wrote (so the caller can
+                  register it with the top-K pruner). Same on every rank.
         """
         state = {
             "model": self.model,
@@ -280,9 +350,188 @@ class Trainer(object):
             'rng_state': torch.get_rng_state(),
             'cuda_rng_state': torch.cuda.get_rng_state()
         }
-        self.lite.save(os.path.join(self.saved_model_root, 'checkpoint-{}'.format(self.cur_step+1)), state=state)
+        ckpt_dir = os.path.join(self.saved_model_root, 'checkpoint-{}'.format(self.cur_step + 1))
+        self.lite.save(ckpt_dir, state=state)
         if self.rank == 0 and verbose:
-            self.logger.info(set_color('Saving current', 'blue') + f': {self.saved_model_root}')
+            self.logger.info(set_color('Saving current', 'blue') + f': {ckpt_dir}')
+        return ckpt_dir
+
+    # ----------------------------------------------------------------------
+    # V0-aligned online eval + checkpoint top-K retention
+    # ----------------------------------------------------------------------
+    def _build_v0_eval_pack_if_needed(self):
+        """Lazily build the eval pack on each rank.
+
+        We let every rank build its own pack (instead of broadcasting from
+        rank-0) because the V0 memmap embedding is page-cached at the OS
+        level -- having every rank read the same file is essentially free,
+        and avoids a few GB of cuda-tensor broadcast traffic per launch.
+        """
+        if self._v0_eval_pack is not None:
+            return
+        from REDRec.data.dataset import build_v0_eval_pack, load_v0_embeddings
+
+        d = self.config.data
+        # Path resolution: prefer the gold-standard 'precomputed_embedding_dir'
+        # (used by REDRecPrecomputedEmbeddingDataset memmap mode), then fall
+        # back to the V0-aligned 'v0_embedding_dir', then the legacy single-npy.
+        emb_path = (d.get('precomputed_embedding_dir', None)
+                    or d.get('v0_embedding_dir', None)
+                    or d.get('embedding_dir', None)
+                    or d.get('precomputed_embedding_npy', None))
+        if not emb_path:
+            self.logger.error('[v0_eval] no embedding path configured; disabling eval.')
+            self._v0_eval_enabled = False
+            return
+        if self.rank == 0:
+            self.logger.info('[v0_eval] building eval pack on each rank ...')
+        _cids, embeddings, cid_index = load_v0_embeddings(emb_path)
+        pack = build_v0_eval_pack(self.config, embeddings, cid_index, logger=self.logger)
+        if pack is None:
+            self.logger.error('[v0_eval] eval pack is empty; disabling eval.')
+            self._v0_eval_enabled = False
+            return
+        self._v0_eval_pack = pack
+        if self.rank == 0:
+            # New eval-pack schema (v0_aligned_dataset.build_v0_eval_pack):
+            #   seq_cid_idx (U, L) int64 cpu  -- per-user per-step row index
+            #                                    into `embeddings_ref` (memmap).
+            #   mask        (U, L) uint8 cpu
+            #   target_idx  (U,)   int64 cpu
+            #   embeddings_ref                -- shared memmap, NOT a copy.
+            #   embed_dim, num_items          -- meta.
+            # We don't materialize a fp32 (N, D) item_pool any more; that
+            # tensor lives only on the GPU during evaluate_v0_recall.
+            self.logger.info(
+                f'[v0_eval] eval pack ready: samples={pack["seq_cid_idx"].size(0)} '
+                f'item_pool=({pack["num_items"]}, {pack["embed_dim"]}) '
+                f'(memmap-backed, materialized on GPU per eval)'
+            )
+        # Sync after the (potentially heavy) eval-pack build so that no rank
+        # races into the next training step / first eval before everyone is
+        # done loading the item pool.
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
+    def _run_v0_eval(self):
+        """Run online recall eval and write metrics to log + tensorboard.
+
+        Returns:
+            float: redrec top500_recall on rank-0 (None on other ranks). Used
+                   by the top-K ckpt pruner. (Aligned with the v0 reference
+                   run: top1/top50/top100/top500 against the full item pool.)
+        """
+        from REDRec.data.dataset import evaluate_v0_recall, format_recall_table
+
+        self._build_v0_eval_pack_if_needed()
+        if not self._v0_eval_enabled or self._v0_eval_pack is None:
+            return None
+
+        # Eval allocates ~13.3 GB GPU for the item pool (raw + L2-normalized,
+        # 6.67 GB each). Pre-release any cached training activations so we
+        # have a clean ~50+ GB slack on each H20 for the eval forward.
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+        # mean_pool / last_pool don't change over time; evaluate them only on
+        # the FIRST eval call, then reuse the cached numbers.
+        eval_baselines_now = self._v0_baseline_cache is None
+
+        # Aligned with the v0 reference run
+        # (/apdcephfs_gy4/share_303218624/jingweidong/output/logs/nohup_20260602_114853.log):
+        # report top1 / top50 / top100 / top500 over the full item pool.
+        ks = (1, 50, 100, 500)
+        try:
+            results = evaluate_v0_recall(
+                model=self.model,
+                eval_pack=self._v0_eval_pack,
+                device=torch.device(self.device),
+                rank=self.rank,
+                world_size=world_size,
+                user_batch=int(self.config.training.get('eval_user_batch', 128)),
+                score_chunk=int(self.config.training.get('eval_score_chunk', 512)),
+                ks=ks,
+                eval_baselines=eval_baselines_now,
+            )
+        except Exception as e:
+            self.logger.error(f'[v0_eval] eval failed at step {self.cur_step}: {e!r}')
+            return None
+
+        if eval_baselines_now and 'mean_pool' in results and 'last_pool' in results:
+            self._v0_baseline_cache = {
+                'mean_pool': results['mean_pool'],
+                'last_pool': results['last_pool'],
+            }
+            # last8_pool / last32_pool are also zero-param + target-time invariant,
+            # so cache them too if the eval block produced them.
+            for _name in ('last8_pool', 'last32_pool'):
+                if _name in results:
+                    self._v0_baseline_cache[_name] = results[_name]
+        else:
+            # Inject cached baselines so the printed table is always complete.
+            if self._v0_baseline_cache is not None:
+                for k, v in self._v0_baseline_cache.items():
+                    results.setdefault(k, v)
+
+        top500 = float(results.get('redrec', {}).get('top500_recall', 0.0)) if self.rank == 0 else None
+
+        if self.rank == 0:
+            for name, m in results.items():
+                for k in ks:
+                    self.tensorboad_writer.add_scalar(
+                        f'eval_recall/{name}_top{k}', m[f'top{k}_recall'], self.cur_step
+                    )
+            self.logger.info(
+                f'[v0_eval] step={self.cur_step}\n' + format_recall_table(results, ks=ks)
+            )
+        return top500
+
+    def _register_and_prune_ckpts(self, ckpt_dir: str, top500_recall: float):
+        """Append the new ckpt to the top-K list and delete anything past K.
+
+        Rank-0 only. Higher ``top500_recall`` is better. Ties are broken by
+        keep-newer (we put the new entry at the front of equal-recall ties).
+        Final-step ckpts (cur_step == total_step) are excluded from pruning.
+        """
+        if self.rank != 0:
+            return
+        # Skip pruning at the final step so the user always has the last ckpt.
+        is_final = (self.cur_step == self.total_step)
+        if is_final:
+            self.logger.info(
+                f'[ckpt_topk] step={self.cur_step} is final; skip pruning '
+                f'(ckpt={ckpt_dir} top500={top500_recall:.4f})'
+            )
+            return
+
+        self._ckpt_records.append((float(top500_recall), ckpt_dir))
+        # Sort desc by recall, stable so insertion order tie-breaks newer-first.
+        self._ckpt_records.sort(key=lambda x: x[0], reverse=True)
+        keep = self._ckpt_records[: self._ckpt_top_k]
+        drop = self._ckpt_records[self._ckpt_top_k:]
+        self._ckpt_records = keep
+
+        for recall, path in drop:
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.isfile(path):
+                    os.remove(path)
+                self.logger.info(
+                    f'[ckpt_topk] pruned ckpt (top500={recall:.4f}): {path}'
+                )
+            except Exception as e:
+                self.logger.warning(f'[ckpt_topk] failed to remove {path}: {e!r}')
+
+        kept_str = ', '.join(
+            f'{os.path.basename(p)}@{r:.4f}' for r, p in self._ckpt_records
+        )
+        self.logger.info(
+            f'[ckpt_topk] step={self.cur_step} keep top {self._ckpt_top_k}: [{kept_str}]'
+        )
     
     def _check_nan(self, loss):
         if torch.isnan(loss):
@@ -298,8 +547,12 @@ class Trainer(object):
             return tdata
         elif isinstance(data, dict):
             for k, v in data.items():
-                if "action" not in k and (k != "pos_inputs" or k != "neg_inputs"):
+                if torch.is_tensor(v):
                     data[k] = v.to(device)
+                elif isinstance(v, dict):
+                    for sub_key in v.keys():
+                        if torch.is_tensor(v[sub_key]):
+                            v[sub_key] = v[sub_key].to(device)
             if "pos_inputs" in data.keys():
                 for key in data['pos_inputs'].keys():
                     data['pos_inputs'][key] = data['pos_inputs'][key].to(device)

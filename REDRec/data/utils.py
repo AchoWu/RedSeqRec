@@ -11,6 +11,14 @@ def bulid_dataloader(config, local_rank=None, world_size=None):
     dataset_dict = {
         'REDRec': ('REDRecDataset'),
     }
+    if config.data.get('dataset_type', None) == 'precomputed_embedding':
+        dataset_dict['REDRec'] = 'REDRecPrecomputedEmbeddingDataset'
+    # V0-aligned dataset: V0Simple data protocol (label=seq -> input,
+    # label=pos -> target, V0 memmap embedding directory). The model
+    # sees the SAME batch-dict schema as the official precomputed path,
+    # so model.forward_precomputed_embedding can be reused unchanged.
+    if config.data.get('dataset_type', None) == 'v0_aligned':
+        dataset_dict['REDRec'] = 'REDRecV0AlignedDataset'
     
     model_name = config.model.model_name
     dataset_module = importlib.import_module('REDRec.data.dataset')

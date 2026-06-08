@@ -7,7 +7,14 @@
 
 set -euo pipefail
 
-CONFIG_PATH="config/demo_multiscene.yaml"
+# Activate the redseqrec conda env explicitly so nohup-launched / detached
+# shells don't fall back to /opt/conda/envs/agentllm (Python 3.12, missing
+# easydict / deepspeed). conda.sh exposes the `conda activate` shell function.
+source /opt/conda/etc/profile.d/conda.sh
+conda activate redseqrec
+echo "[start_train] python = $(which python)  torchrun = $(which torchrun)"
+
+CONFIG_PATH="config/precomputed_embedding_train_shuffle_v2.yaml"
 RUN_PY="run.py"
 
 NPROC_PER_NODE=8

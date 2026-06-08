@@ -1,0 +1,97 @@
+# Eval-only config for "Plan B": user 1.08 series of test on 3000 users with our own data.
+# This file is consumed only by the eval pipeline (generate_user_embedding.py and our
+# custom eval_my_significance.py). It does NOT need a valid training section,
+# but we keep one to satisfy yaml schema expectations.
+data:
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv:   { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''   # not used during eval
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  train_batch_size: 1
+  neg_samples_per_gpu: 1
+  neg_pool_size_per_gpu: 1
+
+  # IMPORTANT: must match the lastn_len used in 01_build_user_lastn.py.
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0       # we have no ads data
+  train_num_workers: 0
+
+model:
+  model_name: REDRec
+  # Qwen2.5-1.5B is required so that hidden_size == 1536 == 3 * 512.
+  item_pretrain_dir: pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: true
+  user_pretrain_dir: pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: false
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  window_pos: 10
+  query_nums: 3                # Pretrained model uses 3 query slots -> user_embed shape [bs, 3*64=192].
+
+training:
+  target: homefeed
+  optim_args:
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+  scheduler_args:
+    type: cosine
+    warmup_steps: 1000
+  eval_step: 5000
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  total_step: 1
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: false
+
+saver:
+  checkpoint_dir: expr
+  log_dir: expr
+  saved_model_name: my_data_eval
+
+eval:
+  target: homefeed
+  # Use the released multiscene checkpoint (already has been downloaded under eval/pre_trained_ckpts/).
+  model_path: pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/
+
+  note_eval:
+    lastn_note_info_path: ''        # not used by Plan B
+    basepool_note_info_path: ''     # not used by Plan B
+
+  user_eval:
+    # Path is resolved relative to cwd at runtime; we run from inside eval/.
+    user_lastn_path: user_lastn_my.json
+    max_lastn_len: 96               # equal to lastn_max_click_note_num_homefeed
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.98
+
+val_only: true
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false

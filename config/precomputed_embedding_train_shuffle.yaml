@@ -1,0 +1,107 @@
+data:
+  dataset_type: precomputed_embedding
+  # Shuffled-version user history (built for fast loading; per-line shuffled)
+  precomputed_user_history_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  # NEW: memmap embedding dir (cids.npy + embeddings.bin + meta.json), 3.25M items, 512-dim
+  precomputed_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+  # Shuffle dataset uses 'seq' as the positive label (vs gold's 'pos').
+  precomputed_positive_label: seq
+  precomputed_sample_lastn: true
+  precomputed_min_history_len: 4
+  precomputed_loop_forever: true
+  precomputed_max_lines: null
+  precomputed_stats_interval: 10000
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  train_batch_size: 8
+  neg_samples_per_gpu: 400
+  neg_pool_size_per_gpu: 1000000
+
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+  train_num_workers: 8
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  window_pos: 10
+  query_nums: 3
+
+training:
+  target: homefeed
+  optim_args:
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    lr_mult_prefix:
+      - 'input_embedding_projector'
+    lr_mult_rate: 10.0
+
+  scheduler_args:
+    type: cosine
+    warmup_steps: 400
+
+  eval_step: 999999
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  total_step: 20000
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: true
+  load_pretrained_model: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/pytorch_model.bin
+
+saver:
+  checkpoint_dir: expr
+  log_dir: expr
+  saved_model_name: precomputed_shuffle_user_tower
+
+eval:
+  target: homefeed
+  model_path: expr/precomputed_shuffle_user_tower/checkpoint-100001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 96
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.98
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false

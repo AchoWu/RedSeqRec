@@ -589,6 +589,295 @@ class REDRecDataset(torch.utils.data.IterableDataset):
         sampler_iterator = self._sample_generator(iter_start, iter_end, worker_id)
         
         return sampler_iterator
+
+
+class REDRecPrecomputedEmbeddingDataset(torch.utils.data.IterableDataset):
+    """Train REDRec user tower from local user histories and precomputed item embeddings.
+
+    Input jsonl format:
+        {"qimei36": "...", "history": [{"cid": "...", "ts": 123, "label": "pos"}, ...]}
+
+    Precomputed embedding npy format:
+        {"cid": np.ndarray[str], "embedding": np.ndarray[float32]}
+    """
+
+    def __init__(self, global_rank, world_size, config):
+        super(REDRecPrecomputedEmbeddingDataset, self).__init__()
+        self.config = config
+        self.global_rank = int(global_rank or 0)
+        self.world_size = int(world_size or 1)
+        self.logger = getLogger()
+
+        self.user_history_jsonl = config.data.precomputed_user_history_jsonl
+        # Embedding source: either a single .npy (legacy / gold-standard format
+        # produced by `np.save({'cid': ..., 'embedding': ...})`) OR a
+        # preprocessed memmap directory (cids.npy + embeddings.bin + meta.json,
+        # shuffle-data format). The latter avoids loading the whole 6+GB
+        # embedding tensor into RAM and supports much larger item pools.
+        self.embedding_npy = config.data.get('precomputed_embedding_npy', None)
+        self.embedding_dir = config.data.get('precomputed_embedding_dir', None)
+        if not self.embedding_npy and not self.embedding_dir:
+            raise ValueError(
+                'Neither precomputed_embedding_npy nor precomputed_embedding_dir '
+                'is set in config.data. One of them is required.'
+            )
+        self.max_seq_len = config.data.get('lastn_max_click_note_num_homefeed', 96)
+        self.train_batch_size = config.data.get('train_batch_size', 1)
+        self.neg_samples_per_gpu = config.data.get('neg_samples_per_gpu', 400)
+        self.min_history_len = config.data.get('precomputed_min_history_len', 4)
+        self.positive_label = config.data.get('precomputed_positive_label', 'pos')
+        self.query_nums = int(config.model.get('query_nums', 1))
+        self.window_size = int(config.model.get('window_pos', self.query_nums if self.query_nums > 0 else 1))
+        # simple_target_strategy:
+        #   'window' (default, official): take the last `window_size` positives as targets,
+        #            the rest as input history.
+        #   'random': randomly pick 1 positive as target, the rest as input history.
+        #            Greatly increases per-user sample diversity (epoch-wise data augmentation).
+        #   'pos_random_seq_input': use items with label==seq_label as input history
+        #            (kept in original order, NOT sorted by ts); randomly pick 1 item
+        #            with label==positive_label as the target. Designed for V0-style
+        #            data where 'seq' = browsing history and 'pos' = ground-truth
+        #            target click. target_window_size is forced to 1.
+        self.target_strategy = str(config.data.get('simple_target_strategy', 'window'))
+        # Input-side label for 'pos_random_seq_input' mode (only used when
+        # target_strategy == 'pos_random_seq_input'); defaults to 'seq' which
+        # matches the V0 jsonl convention.
+        self.input_seq_label = str(config.data.get('precomputed_input_seq_label', 'seq'))
+        if self.target_strategy in ('random', 'pos_random_seq_input'):
+            self.target_window_size = 1
+        else:
+            self.target_window_size = self.window_size
+        self.context_max_len = max(1, self.max_seq_len - self.target_window_size)
+        self.sample_lastn = config.data.get('precomputed_sample_lastn', True)
+        self.loop_forever = config.data.get('precomputed_loop_forever', True)
+        self.max_lines = config.data.get('precomputed_max_lines', None)
+        self.stats_interval = config.data.get('precomputed_stats_interval', 10000)
+
+        if self.embedding_dir is not None:
+            # ---- memmap mode (shuffle-data format) ----
+            # Layout under <embedding_dir>:
+            #   cids.npy        (1-D, int64 or str, num_items)
+            #   embeddings.bin  (raw, num_items * embed_dim * dtype)
+            #   meta.json       ({"num_items":..., "embed_dim":..., "dtype":...})
+            self.logger.info(
+                f'>>> load precomputed item embeddings from dir (memmap mode): {self.embedding_dir}'
+            )
+            with open(os.path.join(self.embedding_dir, 'meta.json'), 'r') as mf:
+                meta = json.load(mf)
+            num_items = int(meta['num_items'])
+            embed_dim = int(meta['embed_dim'])
+            dtype = np.dtype(meta.get('dtype', 'float32'))
+
+            cids_path = os.path.join(self.embedding_dir, 'cids.npy')
+            cids_raw = np.load(cids_path)
+            # Stringify cids so the dataset's cid2idx / jsonl-string lookup
+            # path stays identical to the gold-standard single-npy mode
+            # (jsonl history stores cids as decimal strings).
+            self.cids = cids_raw.astype(str)
+
+            emb_bin = os.path.join(self.embedding_dir, 'embeddings.bin')
+            self.embeddings = np.memmap(
+                emb_bin, dtype=dtype, mode='r', shape=(num_items, embed_dim)
+            )
+            self.cid2idx = {cid: idx for idx, cid in enumerate(self.cids)}
+            self.embed_dim = embed_dim
+            self.all_indices = np.arange(num_items, dtype=np.int64)
+            self.logger.info(
+                f'>>> precomputed embeddings loaded: num={num_items}, dim={self.embed_dim} (memmap)'
+            )
+        else:
+            # ---- single-npy mode (legacy / gold-standard format) ----
+            self.logger.info(f'>>> load precomputed item embeddings from: {self.embedding_npy}')
+            data = np.load(self.embedding_npy, allow_pickle=True).item()
+            self.cids = np.asarray(data['cid']).astype(str)
+            self.embeddings = np.asarray(data['embedding'], dtype=np.float32)
+            self.cid2idx = {cid: idx for idx, cid in enumerate(self.cids)}
+            self.embed_dim = int(self.embeddings.shape[1])
+            self.all_indices = np.arange(len(self.cids), dtype=np.int64)
+            self.logger.info(f'>>> precomputed embeddings loaded: num={len(self.cids)}, dim={self.embed_dim}')
+
+    def __len__(self):
+        return 1000000000
+
+    def _cid_exists(self, cid):
+        return cid in self.cid2idx
+
+    def _get_embedding(self, cid):
+        return self.embeddings[self.cid2idx[cid]]
+
+    def _sample_negative_embeddings(self):
+        replace = len(self.all_indices) < self.neg_samples_per_gpu
+        neg_indices = np.random.choice(self.all_indices, size=self.neg_samples_per_gpu, replace=replace)
+        return self.embeddings[neg_indices]
+
+    def _select_training_window(self, history):
+        """Build one official-style window-NCE sample from positive clicks.
+
+        Official training uses click lastn as positive behavior sequence, samples a
+        lastn window when the sequence is longer than the configured maximum, sorts
+        the sampled window by timestamp, and lets model.window_pos define the target
+        window.  Non-positive records and cids without precomputed embeddings are
+        dropped before this step.
+        """
+        # ---- pos_random_seq_input: input <- 'seq' items, target <- random 'pos' ----
+        # Designed for V0-style jsonl where 'seq' is the browsing history and
+        # 'pos' is the ground-truth target click. We do NOT sort by ts (many
+        # seq events have ts=0 and the upstream feature builder already keeps
+        # them in the intended order).
+        if self.target_strategy == 'pos_random_seq_input':
+            seq_cids, pos_cids = [], []
+            for item in history:
+                cid = item.get('cid')
+                if cid is None:
+                    continue
+                cid = str(cid)
+                if not self._cid_exists(cid):
+                    continue
+                lbl = item.get('label')
+                if lbl == self.input_seq_label:
+                    seq_cids.append(cid)
+                elif lbl == self.positive_label:
+                    pos_cids.append(cid)
+            if len(seq_cids) < self.min_history_len or not pos_cids:
+                return None, None
+            # Cap input length and pick exactly one random target from pos.
+            input_cids = seq_cids[-self.context_max_len:] if self.sample_lastn else seq_cids[:self.context_max_len]
+            target_cids = [random.choice(pos_cids)]
+            if len(input_cids) < self.min_history_len or len(target_cids) != self.target_window_size:
+                return None, None
+            return input_cids, target_cids
+
+        pos_items = []
+        for item in history:
+            cid = item.get('cid')
+            if cid is None:
+                continue
+            if item.get('label') != self.positive_label:
+                continue
+            cid = str(cid)
+            if not self._cid_exists(cid):
+                continue
+            pos_items.append({'cid': cid, 'ts': item.get('ts', 0)})
+
+        pos_items = sorted(pos_items, key=lambda x: x['ts'])
+        if self.sample_lastn and len(pos_items) > self.max_seq_len:
+            pos_items = random.sample(pos_items, self.max_seq_len)
+            pos_items = sorted(pos_items, key=lambda x: x['ts'])
+        else:
+            pos_items = pos_items[-self.max_seq_len:]
+
+        if len(pos_items) < self.min_history_len + self.target_window_size:
+            return None, None
+
+        if self.target_strategy == 'random':
+            # Randomly pick 1 positive as target, the rest (kept in chronological order) as input.
+            # Effectively augments per-user samples by N (= number of positives).
+            pick = random.randrange(len(pos_items))
+            target_items = [pos_items[pick]]
+            input_items = pos_items[:pick] + pos_items[pick + 1:]
+            input_cids = [it['cid'] for it in input_items][-self.context_max_len:]
+            target_cids = [it['cid'] for it in target_items]
+            if len(input_cids) < self.min_history_len or len(target_cids) != self.target_window_size:
+                return None, None
+            return input_cids, target_cids
+
+        pos_cids = [item['cid'] for item in pos_items]
+        target_cids = pos_cids[-self.target_window_size:]
+        input_cids = pos_cids[:-self.target_window_size]
+
+        if len(input_cids) < self.min_history_len or len(target_cids) != self.target_window_size:
+            return None, None
+        return input_cids, target_cids
+
+    def _build_batch(self, samples):
+        batch_size = len(samples)
+        input_embeds = np.zeros((batch_size, self.context_max_len, self.embed_dim), dtype=np.float32)
+        attention_mask = np.zeros((batch_size, self.context_max_len), dtype=np.int64)
+        target_embeds = np.zeros((batch_size, self.target_window_size, self.embed_dim), dtype=np.float32)
+        target_mask = np.zeros((batch_size, self.target_window_size), dtype=np.int64)
+        user_ids = []
+        target_cids = []
+
+        for row, sample in enumerate(samples):
+            user_ids.append(sample['user_id'])
+            target_cids.append(sample['target_cids'])
+            seq_cids = sample['input_cids'][-self.context_max_len:]
+            start = self.context_max_len - len(seq_cids)
+            for offset, cid in enumerate(seq_cids):
+                input_embeds[row, start + offset] = self._get_embedding(cid)
+                attention_mask[row, start + offset] = 1
+
+            cur_target_cids = sample['target_cids'][-self.target_window_size:]
+            for offset, cid in enumerate(cur_target_cids):
+                target_embeds[row, offset] = self._get_embedding(cid)
+                target_mask[row, offset] = 1
+
+        neg_embeds = self._sample_negative_embeddings()
+        return {
+            'precomputed_input_embeds': torch.from_numpy(input_embeds),
+            'precomputed_attention_mask': torch.from_numpy(attention_mask),
+            'precomputed_target_embeds': torch.from_numpy(target_embeds),
+            'precomputed_target_mask': torch.from_numpy(target_mask),
+            'precomputed_neg_embeds': torch.from_numpy(neg_embeds),
+            'user_ids': user_ids,
+            'target_cids': target_cids,
+        }
+
+    def _sample_generator(self, worker_id):
+        self.logger.info(
+            f'>>> precomputed dataset rank={self.global_rank}/{self.world_size}, worker_id={worker_id}, jsonl={self.user_history_jsonl}'
+        )
+        emitted = 0
+        skipped = 0
+
+        while True:
+            batch_samples = []
+            with open(self.user_history_jsonl, 'r', encoding='utf-8') as f:
+                for line_no, line in enumerate(f):
+                    if self.max_lines is not None and line_no >= self.max_lines:
+                        break
+                    if line_no % self.world_size != self.global_rank:
+                        continue
+                    if worker_id is not None:
+                        worker_info = torch.utils.data.get_worker_info()
+                        if worker_info is not None and (line_no // self.world_size) % worker_info.num_workers != worker_id:
+                            continue
+
+                    try:
+                        record = json.loads(line)
+                        input_cids, target_cids = self._select_training_window(record.get('history', []))
+                        if input_cids is None or target_cids is None:
+                            skipped += 1
+                            continue
+
+                        batch_samples.append({
+                            'user_id': record.get('qimei36', ''),
+                            'input_cids': input_cids,
+                            'target_cids': target_cids,
+                        })
+                    except Exception:
+                        skipped += 1
+                        continue
+
+                    if len(batch_samples) >= self.train_batch_size:
+                        emitted += len(batch_samples)
+                        if self.stats_interval and emitted % self.stats_interval == 0:
+                            self.logger.info(f'>>> precomputed dataset emitted={emitted}, skipped={skipped}')
+                        yield self._build_batch(batch_samples)
+                        batch_samples = []
+
+            if batch_samples:
+                emitted += len(batch_samples)
+                yield self._build_batch(batch_samples)
+
+            if not self.loop_forever:
+                break
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else None
+        return self._sample_generator(worker_id)
+
     
 
 

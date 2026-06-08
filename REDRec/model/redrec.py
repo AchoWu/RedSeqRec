@@ -27,7 +27,7 @@ def batch_cosine_matching(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
     for b in range(batch_size):
         cur_sim = sim_matrix[b]
-        cost_matrix = -cur_sim.detach().cpu().numpy()
+        cost_matrix = -cur_sim.detach().float().cpu().numpy()
         cost_matrix = np.nan_to_num(cost_matrix)
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         matches = torch.full((N,), -1, dtype=torch.long, device=device)
@@ -72,7 +72,7 @@ def cluster_based_matching(A: torch.Tensor, B: torch.Tensor, num_iter: int = 5) 
     matched_B = torch.zeros_like(A)
     for b in range(batch_size):
         sim_matrix = torch.mm(cluster_centers[b], B[b].T)
-        cost_matrix = -sim_matrix.detach().cpu().numpy()
+        cost_matrix = -sim_matrix.detach().float().cpu().numpy()
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         cluster_to_B = torch.zeros(n, dtype=torch.long, device=device)
         cluster_to_B[row_ind] = torch.tensor(col_ind, device=device)
@@ -206,15 +206,42 @@ class REDRec(BaseModel):
         self.engage_action_n = mcfg.get('engage_action_n', 5)
         self.llm_init_item = mcfg.get('item_llm_init', True)
         self.llm_init_user = mcfg.get('user_llm_init', True)
+        # Both 'precomputed_embedding' (official) and 'v0_aligned' (V0Simple-aligned)
+        # datasets feed pre-encoded item embeddings into the user tower, so they share
+        # the same model topology: item_llm is dropped, input_embedding_projector is
+        # added to lift the precomputed dim to user_llm.hidden_size, and forward goes
+        # through forward_precomputed_embedding.
+        self.use_precomputed_embedding = dcfg.get('dataset_type', None) in (
+            'precomputed_embedding', 'v0_aligned',
+        )
+        self.precomputed_input_dim = mcfg.get('precomputed_input_dim', 512)
 
     def _build_model(self):
         # ----- Item/User LLM -----
-        self.item_llm = self._create_llm(self.item_pretrain_dir, self.llm_init_item, freeze=self.config.training.get('freeze_item', False))
+        if self.use_precomputed_embedding:
+            self.item_llm = None
+        else:
+            self.item_llm = self._create_llm(self.item_pretrain_dir, self.llm_init_item, freeze=self.config.training.get('freeze_item', False))
         self.user_llm = self._create_llm(self.user_pretrain_dir, self.llm_init_user, freeze=False)
-        self.projection_dim = self.item_llm.config.hidden_size
+        self.projection_dim = self.user_llm.config.hidden_size if self.item_llm is None else self.item_llm.config.hidden_size
         
         # ----- Embedding heads -----
-        self.note_embedding_head = ProjectionHead(self.projection_dim, output_dim=64)
+        # user_output_dim controls the intermediate user-tower output dim (default 64).
+        # user_final_dim controls the final output dim after the output MLP (default 512),
+        # which must match the precomputed item embedding dim for NCE and eval.
+        self.user_output_dim = int(self.config.model.get('user_output_dim', 64))
+        self.user_final_dim = int(self.config.model.get('user_final_dim', 512))
+        self.note_embedding_head = ProjectionHead(self.projection_dim, output_dim=self.user_output_dim)
+        # MLP to lift user_output_dim (64) to user_final_dim (512) for NCE loss & eval.
+        if self.user_output_dim != self.user_final_dim:
+            self.output_mlp = nn.Sequential(
+                nn.Linear(self.user_output_dim, self.user_final_dim * 2),
+                nn.GELU(),
+                nn.Linear(self.user_final_dim * 2, self.user_final_dim),
+                nn.LayerNorm(self.user_final_dim),
+            )
+        else:
+            self.output_mlp = nn.Identity()
         self.item_emb_token_n = 1
         self.item_emb_tokens = nn.Parameter(torch.zeros(1, self.item_emb_token_n, self.projection_dim))
         self.item_emb_tokens.data.normal_(mean=0.0, std=0.02)
@@ -253,6 +280,13 @@ class REDRec(BaseModel):
         if self.add_position_embed:
             self.position_embeddings = nn.Embedding(200, self.projection_dim)
 
+        if self.use_precomputed_embedding:
+            self.input_embedding_projector = nn.Sequential(
+                nn.Linear(self.precomputed_input_dim, self.projection_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.projection_dim),
+            )
+
     def _create_llm(self, pretrain_dir, init=True, freeze=False):
         hf_config = AutoConfig.from_pretrained(pretrain_dir, trust_remote_code=True)
         hf_config.gradient_checkpointing = self.gradient_checkpointing
@@ -260,8 +294,19 @@ class REDRec(BaseModel):
         hf_config.return_dict = True
         hf_config.use_cache = False
 
-        llm = AutoModelForCausalLM.from_pretrained(pretrain_dir, config=hf_config) if init else \
-            AutoModelForCausalLM(config=hf_config).cuda()
+        # NOTE: newer `transformers` (>=4.40-ish) forbids the bare
+        # `AutoModelForCausalLM(config=...)` ctor and requires going through
+        # one of the two factory methods. We use `from_config` for the
+        # random-init branch (no pretrained weights, model lives on CPU
+        # initially -- DeepSpeed will move/shard it during engine init,
+        # which is also why we drop the explicit `.cuda()` here: under
+        # ZeRO-3 forcing CUDA materialization here defeats stage-3 param
+        # partitioning and risks OOM on rank 0).
+        llm = (
+            AutoModelForCausalLM.from_pretrained(pretrain_dir, config=hf_config)
+            if init else
+            AutoModelForCausalLM.from_config(hf_config)
+        )
 
         if freeze:
             self.logger.info("Freezing parameters of LLM: {}".format(pretrain_dir))
@@ -380,6 +425,9 @@ class REDRec(BaseModel):
         return user_feats, user_mask, reconstruct_loss
 
     def forward(self, interaction):
+        if self.use_precomputed_embedding or 'precomputed_input_embeds' in interaction:
+            return self.forward_precomputed_embedding(interaction)
+
         user_feats, mask, reconstruct_loss = self.get_user_inputs(interaction)
         user_hidden = self.user_llm(inputs_embeds=user_feats, attention_mask=mask).hidden_states[-1]
         user_emb64 = self.note_embedding_head(user_hidden)
@@ -424,11 +472,109 @@ class REDRec(BaseModel):
             'nce_samples': (logits > torch.finfo(logits.dtype).min / 100).sum(dim=1).float().mean()
         }
         
-        for k in [1, 10, 100]:
+        # Top-k accuracies. Extended from official [1,10,100] to also include
+        # 50/500 to align with V0Simple baseline. Keep increasing for `break`.
+        for k in [1, 10, 50, 100, 500]:
             if k > logits.size(1): break
             indices = logits.topk(k, dim=1).indices
             model_out[f"nce_top{k}_acc"] = labels.view(-1, 1).eq(indices).any(dim=1).float().mean()
         
+        return model_out
+
+    def forward_precomputed_embedding(self, interaction):
+        input_embeds = interaction['precomputed_input_embeds'].to(dtype=self.input_embedding_projector[0].weight.dtype)
+        attention_mask = interaction['precomputed_attention_mask'].long()
+        target_embeds = interaction['precomputed_target_embeds'].to(dtype=self.input_embedding_projector[0].weight.dtype)
+        neg_embeds = interaction['precomputed_neg_embeds'].to(dtype=self.input_embedding_projector[0].weight.dtype)
+
+        if target_embeds.dim() == 2:
+            target_embeds = target_embeds.unsqueeze(1)
+
+        target_mask = interaction.get('precomputed_target_mask', None)
+        if target_mask is not None:
+            target_mask = target_mask.bool()
+        else:
+            target_mask = torch.ones(target_embeds.shape[:2], dtype=torch.bool, device=target_embeds.device)
+
+        # User side: project 512->1536, pass through user_llm, then note_embedding_head to 64-d
+        user_feats = self.input_embedding_projector(input_embeds)
+
+        if self.query_nums > 0:
+            batch_size = user_feats.shape[0]
+            query_embedding = self.query(torch.arange(self.query_nums, device=user_feats.device))
+            user_feats = torch.cat([user_feats, query_embedding.unsqueeze(0).repeat(batch_size, 1, 1)], dim=1)
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((batch_size, self.query_nums), dtype=attention_mask.dtype, device=attention_mask.device)
+            ], dim=1)
+
+        user_hidden = self.user_llm(inputs_embeds=user_feats, attention_mask=attention_mask).hidden_states[-1]
+        user_emb64 = self.note_embedding_head(user_hidden)
+
+        # Lift user embedding from user_output_dim (64) to user_final_dim (512)
+        # via the output MLP so it aligns with the full-dim item embeddings.
+        user_emb64 = self.output_mlp(user_emb64)
+
+        # Item side: slice by user_final_dim (512) -- effectively a no-op when
+        # precomputed_input_dim == user_final_dim.
+        D_out = self.user_final_dim
+        target_emb64 = target_embeds[:, :, :D_out]
+        neg_emb64 = neg_embeds[:, :, :D_out] if neg_embeds.dim() == 3 else neg_embeds[:, :D_out]
+
+        target_num = target_emb64.size(1)
+        if self.query_nums > 0:
+            output_embs = user_emb64[:, -self.query_nums:]
+        else:
+            output_embs = user_emb64[:, -target_num:]
+
+        with torch.no_grad():
+            self.logit_scale.clamp_(0, np.log(100))
+
+        logit_scale = self.logit_scale.exp()
+        output_embs = output_embs / output_embs.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        target_emb64 = target_emb64 / target_emb64.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        neg_emb64 = neg_emb64 / neg_emb64.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        if self.query_nums > 0:
+            # Fast path: when query_nums == target_num (typical case query_nums=1, target_num=1),
+            # cluster_based_matching degenerates to identity (linear_sum_assignment on 1x1 etc.).
+            # Skip the per-sample CPU call to avoid GPU<->CPU sync overhead.
+            if output_embs.size(1) == target_emb64.size(1):
+                matched_output_embs = output_embs
+            else:
+                matched_output_embs = cluster_based_matching(target_emb64, output_embs)
+        else:
+            matched_output_embs = output_embs[:, -target_num:]
+
+        pos_logits = F.cosine_similarity(matched_output_embs, target_emb64, dim=-1).unsqueeze(-1)
+
+        D = neg_emb64.size(-1)
+        neg_embedding_all = all_gather(neg_emb64, sync_grads=True).reshape(-1, D).transpose(-1, -2)
+        neg_logits = torch.matmul(matched_output_embs, neg_embedding_all)
+        fix_logits = torch.matmul(target_emb64, neg_embedding_all)
+        neg_logits[fix_logits > self.nce_thres] = torch.finfo(neg_logits.dtype).min
+
+        logits = torch.cat([pos_logits, neg_logits], dim=-1)
+        logits = logits[target_mask] * logit_scale
+        labels = torch.zeros(logits.size(0), device=logits.device, dtype=torch.int64)
+        user_embed_loss = F.cross_entropy(logits, labels)
+
+        model_out = {
+            'reconstruct_loss': torch.zeros((), device=logits.device, dtype=user_embed_loss.dtype),
+            'user_embed_loss': user_embed_loss,
+            'ae_decay': self.ae_decay,
+            'loss': user_embed_loss,
+            'nce_samples': (logits > torch.finfo(logits.dtype).min / 100).sum(dim=1).float().mean()
+        }
+        # Top-k accuracies. Extended from official [1,10,100] to also include
+        # 50/500 so we can compare apples-to-apples with the V0Simple baseline,
+        # which logs top1/top50/top100/top500. Keep the list strictly increasing
+        # so that the `break` skips only out-of-range k.
+        for k in [1, 10, 50, 100, 500]:
+            if k > logits.size(1):
+                break
+            indices = logits.topk(k, dim=1).indices
+            model_out[f"nce_top{k}_acc"] = labels.view(-1, 1).eq(indices).any(dim=1).float().mean()
         return model_out
     
     # ----------------- Deployment/Embedding APIs -----------------
@@ -437,18 +583,23 @@ class REDRec(BaseModel):
     def compute_user_embedding_homefeed(self, batch, note_id2idx, raw_embeds, device):
         """Batch user embedding from sequence note_id, using raw_embeds."""
         raw_embeds = np.array(raw_embeds)
+        input_dim = raw_embeds.shape[1]
         lastns_homefeed = np.array(batch["note_seqs_homefeed"])
         attention_mask_homefeed = torch.from_numpy(lastns_homefeed != '-1').int().to(device)
         batch_size, seq_len_homefeed = attention_mask_homefeed.shape
-        features_homefeed = torch.zeros([batch_size, seq_len_homefeed, self.item_llm.config.hidden_size], dtype=torch.bfloat16)
+        features_homefeed = torch.zeros([batch_size, seq_len_homefeed, input_dim], dtype=torch.float32, device=device)
         
         for idx in range(batch_size):
             for note_idx, note_id in enumerate(lastns_homefeed[idx]):
                 if note_id != '-1' and note_id in note_id2idx:
-                    cur_note_embed = torch.from_numpy(raw_embeds[note_id2idx[note_id]]).bfloat16().to(device)
+                    cur_note_embed = torch.from_numpy(raw_embeds[note_id2idx[note_id]]).float().to(device)
                     features_homefeed[idx, note_idx] = cur_note_embed
         
         features = features_homefeed
+        if hasattr(self, 'input_embedding_projector'):
+            features = self.input_embedding_projector(features.to(dtype=self.input_embedding_projector[0].weight.dtype))
+        else:
+            features = features.to(dtype=torch.bfloat16)
         mask = attention_mask_homefeed
         
         if self.query_nums > 0:
@@ -459,6 +610,7 @@ class REDRec(BaseModel):
         
         user_hidden = self.user_llm(inputs_embeds=features, attention_mask=mask).hidden_states[-1]
         user_emb64 = self.note_embedding_head(user_hidden)
+        user_emb64 = self.output_mlp(user_emb64)
         user_emb_final = user_emb64[:, -self.query_nums:] if self.query_nums > 0 else user_emb64[:, -1:]
         normed_embs = user_emb_final / user_emb_final.norm(dim=-1, keepdim=True)
         normed_embs = normed_embs.flatten(1, 2)
@@ -475,6 +627,7 @@ class REDRec(BaseModel):
         """
         # import pdb;pdb.set_trace()
         raw_embeds = np.array(raw_embeds)
+        input_dim = raw_embeds.shape[1]
         lastns_homefeed = np.array(batch["note_seqs_homefeed"])
         lastns_ads = np.array(batch["note_seqs_ads"])
         attention_mask_homefeed = (lastns_homefeed != '-1')
@@ -483,8 +636,8 @@ class REDRec(BaseModel):
         attention_mask_ads = torch.from_numpy(attention_mask_ads).int().to(device)
         batch_size, seq_len_ads = attention_mask_ads.shape
         batch_size, seq_len_homefeed = attention_mask_homefeed.shape
-        features_homefeed = torch.rand([batch_size, seq_len_homefeed, self.item_llm.config.hidden_size], dtype=torch.bfloat16)
-        features_ads = torch.rand([batch_size, seq_len_ads, self.item_llm.config.hidden_size], dtype=torch.bfloat16)
+        features_homefeed = torch.zeros([batch_size, seq_len_homefeed, input_dim], dtype=torch.float32, device=device)
+        features_ads = torch.zeros([batch_size, seq_len_ads, input_dim], dtype=torch.float32, device=device)
         
         all_exist_flag = []
         for idx in range(batch_size):
@@ -496,7 +649,7 @@ class REDRec(BaseModel):
                     continue
                 if note_id in note_id2idx:
                     cur_note_embed = raw_embeds[note_id2idx[note_id]]
-                    cur_note_embed = torch.from_numpy(cur_note_embed).bfloat16().to(device)
+                    cur_note_embed = torch.from_numpy(cur_note_embed).float().to(device)
                     features_homefeed[idx, note_idx] = cur_note_embed
 
             for note_idx, note_id in enumerate(cur_user_lastn_ads):
@@ -504,11 +657,18 @@ class REDRec(BaseModel):
                     continue
                 if note_id in note_id2idx:
                     cur_note_embed = raw_embeds[note_id2idx[note_id]]
-                    cur_note_embed = torch.from_numpy(cur_note_embed).bfloat16().to(device)
+                    cur_note_embed = torch.from_numpy(cur_note_embed).float().to(device)
                     features_ads[idx, note_idx] = cur_note_embed
 
         user_lastn_raw_features = torch.cat([features_homefeed, features_ads], dim=1).to(device)
         attention_mask = torch.cat([attention_mask_homefeed, attention_mask_ads], dim=1).to(device)
+
+        if hasattr(self, 'input_embedding_projector'):
+            user_lastn_raw_features = self.input_embedding_projector(
+                user_lastn_raw_features.to(dtype=self.input_embedding_projector[0].weight.dtype)
+            )
+        else:
+            user_lastn_raw_features = user_lastn_raw_features.to(dtype=torch.bfloat16)
 
         if self.add_item_action_embed:
             user_lastn_action_features = torch.zeros_like(user_lastn_raw_features)
@@ -571,6 +731,7 @@ class REDRec(BaseModel):
         # User LLM encoding
         user_hidden_states = self.user_llm(inputs_embeds=features, attention_mask=attention_mask).hidden_states[-1]
         user_embed_64d = self.note_embedding_head(user_hidden_states)
+        user_embed_64d = self.output_mlp(user_embed_64d)
 
         if self.query_nums > 0:
             user_embed_final_64d = user_embed_64d[:, -self.query_nums:]
@@ -631,7 +792,7 @@ class REDRec(BaseModel):
             attention_mask = torch.cat([attention_mask, torch.ones((N, self.query_nums), dtype=attention_mask.dtype, device=attention_mask.device)], dim=1)
         user_hidden = self.user_llm(inputs_embeds=user_model_inputs, attention_mask=attention_mask).hidden_states[-1]
         user_embed_64d = self.note_embedding_head(user_hidden)
-        
+        user_embed_64d = self.output_mlp(user_embed_64d)
         if self.predict_action:
             action_logits = self.action_predict_head(user_hidden)[:, -1]
         else:
@@ -650,4 +811,3 @@ class REDRec(BaseModel):
         embed = self.latent_proj_decoder(self.latent_proj_encoder(pos_embedding)) if self.AE_compress_dim > 0 else pos_embedding
         embed_64d = self.note_embedding_head(pos_embedding)
         return embed, embed_64d
-

@@ -1,0 +1,214 @@
+data:
+  # ===================================================================
+  # V0-aligned data layout (route to REDRecV0AlignedDataset).
+  # Schema differences vs. the official `precomputed_embedding`:
+  #   * input sequence  = items with label=='seq' (V0 user_last/* schema),
+  #                       NOT label=='pos'. Pos items are reserved as targets.
+  #   * target          = ONE label=='pos' item, randomly picked per step.
+  #   * embedding store = V0 memmap directory (3.25M items x 512 fp32),
+  #                       same backing file V0Simple uses.
+  # ===================================================================
+  dataset_type: v0_aligned
+
+  # V0 train/eval jsonl (already physically shuffled, seed=42).
+  v0_train_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  v0_eval_jsonl:  /apdcephfs_gy4/share_303218624/jingweidong/user_last/test.shuffled.jsonl
+  # V0 memmap embedding directory (embeddings.bin / cids.npy / meta.json).
+  v0_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+
+  # ---- per-user sample selection (V0 defaults, fully aligned) ----
+  seq_label: seq
+  positive_label: pos
+  # Hard-negatives DISABLED in stage 1 to match the V0Simple ablation
+  # (rely on in-batch + global random negs only). To run the hardneg
+  # ablation later, set hard_neg_label: ['hardneg'] and max_hard_neg: 8.
+  hard_neg_label: []
+  max_hard_neg: 0
+  min_history_len: 4
+  max_seq_len: 200            # V0-aligned (was 96 in official precomputed)
+  sample_lastn: true
+  train_target_strategy: random
+  loop_forever: true
+  # V0 train.shuffled.jsonl is already globally shuffled, so this small
+  # buffer is just an anti-correlation safety net (V0 default = 1024).
+  shuffle_buffer_size: 1024
+
+  # ---- hold-out eval (matches V0Simple eval protocol) ----
+  eval_users: 50000           # stride-sample 50k users from test.jsonl
+  eval_target_strategy: all   # one eval sample per pos item (~50k * 7.6 ≈ 380k)
+  eval_seed: 42
+
+  # ---- batch / negatives ----
+  # Stage 1: user_llm frozen (no LLM grad/optim state). With ZeRO-2 + bf16 mixed,
+  # per-GPU model state on H20 is only ~9 GB; the rest (~85 GB) goes to activations.
+  #
+  # !!! IMPORTANT MEMORY LESSON !!!
+  # Freezing user_llm only saves grad / optimizer state. ACTIVATIONS for the
+  # forward pass through 28 Qwen2 decoder layers are still fully retained
+  # (no backward needed but still required by the compute graph). Empirically:
+  #   bs=192, seq=200, no grad_ckpt -> ~85 GB activations -> OOM at first step.
+  #   bs=64,  seq=200, no grad_ckpt -> ~25 GB activations  (the original setting).
+  #   bs=96,  seq=200, no grad_ckpt -> ~38 GB activations  (current sweet spot).
+  # Plus model state ~9 GB and cudnn / attn workspace ~5 GB:
+  #   bs=96 total ~ 50 GB / 96 GB -> ~52% util, comfortable headroom.
+  #
+  # in-batch neg = 96*8 - 1 = 767, plus global random neg = 400*8 = 3200,
+  # so ~3967 effective negatives per pos -- close to V0's 4095.
+  #
+  # If you want to push higher, ENABLE gradient_checkpointing (also in the
+  # `model:` block above) and bs can go to ~256+. But for adapter-only training
+  # the frozen-llm forward dominates and grad_ckpt only modestly helps because
+  # there's no backward through user_llm to amortize the recompute cost.
+  train_batch_size: 96
+  neg_samples_per_gpu: 400
+  neg_pool_size_per_gpu: 1000000
+
+  train_num_workers: 8
+  precomputed_stats_interval: 10000
+
+  # ---- legacy fields kept so existing code paths don't crash ----
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  # user_llm is frozen in stage 1 -> grad ckpt unnecessary; turn it off.
+  gradient_checkpointing: false
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # === Aligned with V0Simple ===
+  user_output_dim: 512
+  query_nums: 1
+  window_pos: 1
+
+# Stage 1: freeze the entire user_llm trunk; train only adapter modules
+# (input_embedding_projector, note_embedding_head, query, logit_scale).
+freeze_prefix:
+  - 'user_llm'
+
+training:
+  target: homefeed
+  optim_args:
+    # Aggressive lr for adapter-only training (~3M params, all randomly init).
+    # Bumped 5e-4 -> 1e-3 after the 2000-step run plateaued at full-pool
+    # recall@10 = 0.0031, well below last_pool baseline 0.0332. Adapter is
+    # tiny and starts from random init, so it can take a much higher lr;
+    # warmup also extended (200 -> 500) to keep early steps stable.
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    warmup_steps: 500
+
+  # log/eval every 1000 steps (matches V0Simple).
+  eval_step: 1000
+  # Online v0-aligned recall eval cadence (top1/10/50/100/500 vs full pool).
+  eval_interval: 1000
+  # Per-rank user-batch for the eval forward pass.
+  eval_user_batch: 128
+  eval_score_chunk: 512
+  # save_step decoupled from log/eval cadence: save less often to save disk.
+  save_step: 1000
+  # Keep only the top-K ckpts by online eval top10_recall.
+  # Stage 1 extended to 5000 steps (5 saves), so K=3 retains the best 3.
+  ckpt_keep_top_k: 3
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  # Bumped 2000 -> 5000 after the 2000-step run showed full-pool recall@10
+  # was still climbing linearly (0.0017 @ step1k -> 0.0031 @ step2k) and
+  # had not approached the last_pool baseline 0.0332 yet. Need more budget
+  # for the adapter to escape the random-init subspace before stage 2.
+  total_step: 5000
+  strategy: deepspeed
+  # ZeRO Stage 2: shard optimizer state + gradients across ranks; KEEP the
+  # full model weights replicated on every rank. Saves ~50% communication
+  # vs. Stage 3 (no per-layer param all-gather/release on every fwd/bwd) and
+  # is plenty cheap on memory because (a) Qwen2.5-1.5B trunk is frozen here
+  # and (b) H20 has 96GB. Checkpoint format remains a ZeRO directory, so
+  # `run.py`'s `load_state_dict_from_zero_checkpoint` path still works.
+  stage: 2
+  gradient_checkpointing: false
+  # Load CLEANED official ckpt (incompatible note_embedding_head / query keys
+  # already stripped by scripts/strip_incompatible_pretrained_keys.py).
+  load_pretrained_model: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/pytorch_model.aligned512.bin
+
+saver:
+  # ===================================================================
+  # V0-aligned output layout. When `v0_style: true`, run.py rewrites
+  # checkpoint_dir / log_dir / saved_model_name at startup so that all
+  # per-run artifacts (ckpts, tb, logger, config snapshot) land under:
+  #
+  #   <output_dir>/<saved_model_name>_<YYYYMMDD_HHMMSS>/
+  #     ├── tb/                            (tensorboard events)
+  #     ├── checkpoint-<step>/             (DeepSpeed ZeRO ckpt dirs)
+  #     ├── train_config_<run_suffix>.json (resolved-config snapshot)
+  #     └── logger/<inner_ts>.log          (training log)
+  #
+  # The timestamp suffix is generated on rank-0 and broadcast to every
+  # rank, so all ranks agree on the same subdir.
+  # ===================================================================
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  v0_style: true
+  # checkpoint_dir / log_dir are auto-overwritten to `output_dir` by
+  # run.py when v0_style is on (left here only as failsafe defaults).
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  # Base run name; the actual on-disk subdir is `<saved_model_name>_<ts>`.
+  saved_model_name: v0aligned_stage1_adapter
+
+eval:
+  target: homefeed
+  # NOTE: Under v0_style, the actual ckpt path is
+  # <saver.output_dir>/<saved_model_name>_<run_ts>/checkpoint-<step>/.
+  # Replace the timestamp below with the actual run dir before running
+  # any offline eval script.
+  model_path: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/v0aligned_stage1_adapter_<RUN_TS>/checkpoint-2001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 200
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+# V0Simple-aligned: filter in-batch / global negatives whose cosine
+# similarity to the target exceeds this threshold (avoids false negatives).
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+# Print training log every 10 steps (V0Simple cadence).
+update_interval: 10
+reproducibility: false
