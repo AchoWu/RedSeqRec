@@ -42,10 +42,18 @@ if [[ "${DEBUG:-}" == "1" ]]; then
       "$@"
 else
     echo "Launching distributed training ..."
+    # Same bs=4 / acc=8 override as DEBUG: avoids the cuBLAS Lt SIGFPE on
+    # the first backward through note_embedding_head when train_batch_size >= 8.
+    # Trade-off: per-rank in-batch negatives drop from yaml's bs=32 to 4
+    # (cross-rank InfoNCE still has 4 * world_size negatives via all-gather).
+    # Bump --training.accumulation_steps in "$@" if you need a larger
+    # effective batch.
     torchrun \
       --nproc_per_node=$NPROC_PER_NODE \
       --master_port=$MASTER_PORT \
       "$RUN_PY" \
       --config_path "${CONFIG_PATH}" \
+      --data.train_batch_size 4 \
+      --training.accumulation_steps 8 \
       "$@"
 fi
