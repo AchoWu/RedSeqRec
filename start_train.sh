@@ -22,38 +22,40 @@ RUN_PY="run.py"
 NPROC_PER_NODE=8
 MASTER_PORT=16669
 
+# Default per-rank micro-batch + gradient accumulation. Effective per-rank
+# batch size = train_batch_size * accumulation_steps = 32 (matches the yaml).
+#
+# Why bs=4 instead of bs=32: cuBLAS Lt has a SIGFPE bug on the first backward
+# through note_embedding_head ([64,1536] reverse) when train_batch_size >= 8.
+# bs=4 sidesteps the buggy heuristic. The contrastive signal is unaffected:
+# REDRecPrecomputedEmbeddingDataset samples `neg_samples_per_gpu` (default 512)
+# random negatives from the full item pool per row, so per-step negatives are
+# bs * neg_samples_per_gpu * world_size = 16k @ bs=4/8-rank, still far above
+# the in-batch baseline. Override via --data.train_batch_size /
+# --training.accumulation_steps in "$@" if cuBLAS is fixed (run.py applies
+# extra args in order; later occurrence wins).
+train_batch_size=4
+accumulation_steps=8
+
 if [[ "${DEBUG:-}" == "1" ]]; then
     DEBUG_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
     echo "Launching in DEBUG (single GPU) on CUDA_VISIBLE_DEVICES=${DEBUG_CUDA_VISIBLE_DEVICES} ..."
-    # DEBUG-mode defaults:
-    #   - train_batch_size=4 + accumulation_steps=8: equivalent effective bs=32
-    #     while avoiding the cuBLAS Lt SIGFPE that fires on the first backward
-    #     when bs >= 8 (note_embedding_head [64,1536] reverse hits a buggy Lt
-    #     heuristic at larger m). User-supplied --data.train_batch_size /
-    #     --training.accumulation_steps in "$@" override these (run.py applies
-    #     extra args in order; later wins).
     CUDA_VISIBLE_DEVICES="${DEBUG_CUDA_VISIBLE_DEVICES}" torchrun \
       --nproc_per_node=1 \
       --master_port=$MASTER_PORT \
       "$RUN_PY" \
       --config_path "${CONFIG_PATH}" \
-      --data.train_batch_size 4 \
-      --training.accumulation_steps 8 \
+      --data.train_batch_size "${train_batch_size}" \
+      --training.accumulation_steps "${accumulation_steps}" \
       "$@"
 else
     echo "Launching distributed training ..."
-    # Same bs=4 / acc=8 override as DEBUG: avoids the cuBLAS Lt SIGFPE on
-    # the first backward through note_embedding_head when train_batch_size >= 8.
-    # Trade-off: per-rank in-batch negatives drop from yaml's bs=32 to 4
-    # (cross-rank InfoNCE still has 4 * world_size negatives via all-gather).
-    # Bump --training.accumulation_steps in "$@" if you need a larger
-    # effective batch.
     torchrun \
       --nproc_per_node=$NPROC_PER_NODE \
       --master_port=$MASTER_PORT \
       "$RUN_PY" \
       --config_path "${CONFIG_PATH}" \
-      --data.train_batch_size 4 \
-      --training.accumulation_steps 8 \
+      --data.train_batch_size "${train_batch_size}" \
+      --training.accumulation_steps "${accumulation_steps}" \
       "$@"
 fi
