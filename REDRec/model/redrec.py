@@ -281,6 +281,8 @@ class REDRec(BaseModel):
             self.position_embeddings = nn.Embedding(200, self.projection_dim)
 
         if self.use_precomputed_embedding:
+            # 512 -> 1536
+            # 使用 mlp 生维对齐 qb embedding
             self.input_embedding_projector = nn.Sequential(
                 nn.Linear(self.precomputed_input_dim, self.projection_dim),
                 nn.GELU(),

@@ -447,18 +447,26 @@ def format_recall_table(results: Dict[str, Dict[str, float]],
         cells = ' | '.join(f'{m[f"top{k}_recall"]:>10.4f}' for k in ks)
         lines.append(f"{name:<12} | {cells}")
     if 'redrec' in results:
-        baselines = []
-        if 'mean_pool' in results:
-            baselines.append(results['mean_pool']['top10_recall'])
-        if 'last_pool' in results:
-            baselines.append(results['last_pool']['top10_recall'])
-        if baselines:
-            best = max(baselines)
-            v = results['redrec']['top10_recall']
-            if best > 0:
-                lines.append('')
-                lines.append(
-                    f'>>> redrec top10 lift over best pooling baseline: '
-                    f'{(v - best) / best * 100:+.2f}%'
-                )
+        # Pick a k for the "lift over best pooling baseline" line. Prefer 10 to
+        # match the historical default; if 10 isn't in `ks` (e.g. the trainer
+        # configured ks=(1,50,100,500) to align with the v0 reference run),
+        # fall back to the smallest k present so the table still prints.
+        ks_list = list(ks)
+        lift_k = 10 if 10 in ks_list else (min(ks_list) if ks_list else None)
+        if lift_k is not None:
+            lift_key = f'top{lift_k}_recall'
+            baselines = []
+            if 'mean_pool' in results and lift_key in results['mean_pool']:
+                baselines.append(results['mean_pool'][lift_key])
+            if 'last_pool' in results and lift_key in results['last_pool']:
+                baselines.append(results['last_pool'][lift_key])
+            if baselines:
+                best = max(baselines)
+                v = results['redrec'].get(lift_key, 0.0)
+                if best > 0:
+                    lines.append('')
+                    lines.append(
+                        f'>>> redrec top{lift_k} lift over best pooling baseline: '
+                        f'{(v - best) / best * 100:+.2f}%'
+                    )
     return '\n'.join(lines)

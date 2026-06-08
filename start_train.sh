@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Usage: DEBUG=1 bash start_train.sh [args]
-#   In debug mode: runs single GPU CUDA_VISIBLE_DEVICES=0 python ...
+#   In debug mode: runs single GPU. Defaults to CUDA_VISIBLE_DEVICES=0;
+#   override by exporting/prefixing CUDA_VISIBLE_DEVICES, e.g.:
+#     DEBUG=1 CUDA_VISIBLE_DEVICES=3 bash start_train.sh
 # Usage: bash start_train.sh [args]
 #   In normal mode: runs torchrun ...
 
@@ -21,8 +23,9 @@ NPROC_PER_NODE=8
 MASTER_PORT=16669
 
 if [[ "${DEBUG:-}" == "1" ]]; then
-    echo "Launching in DEBUG (single GPU)..."
-    CUDA_VISIBLE_DEVICES=0 torchrun \
+    DEBUG_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+    echo "Launching in DEBUG (single GPU) on CUDA_VISIBLE_DEVICES=${DEBUG_CUDA_VISIBLE_DEVICES} ..."
+    CUDA_VISIBLE_DEVICES="${DEBUG_CUDA_VISIBLE_DEVICES}" torchrun \
       --nproc_per_node=1 \
       --master_port=$MASTER_PORT \
       "$RUN_PY" \
