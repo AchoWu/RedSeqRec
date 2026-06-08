@@ -25,11 +25,20 @@ MASTER_PORT=16669
 if [[ "${DEBUG:-}" == "1" ]]; then
     DEBUG_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
     echo "Launching in DEBUG (single GPU) on CUDA_VISIBLE_DEVICES=${DEBUG_CUDA_VISIBLE_DEVICES} ..."
+    # DEBUG-mode defaults:
+    #   - train_batch_size=4 + accumulation_steps=8: equivalent effective bs=32
+    #     while avoiding the cuBLAS Lt SIGFPE that fires on the first backward
+    #     when bs >= 8 (note_embedding_head [64,1536] reverse hits a buggy Lt
+    #     heuristic at larger m). User-supplied --data.train_batch_size /
+    #     --training.accumulation_steps in "$@" override these (run.py applies
+    #     extra args in order; later wins).
     CUDA_VISIBLE_DEVICES="${DEBUG_CUDA_VISIBLE_DEVICES}" torchrun \
       --nproc_per_node=1 \
       --master_port=$MASTER_PORT \
       "$RUN_PY" \
       --config_path "${CONFIG_PATH}" \
+      --data.train_batch_size 4 \
+      --training.accumulation_steps 8 \
       "$@"
 else
     echo "Launching distributed training ..."
