@@ -16,27 +16,46 @@ source /opt/conda/etc/profile.d/conda.sh
 conda activate redseqrec
 echo "[start_train] python = $(which python)  torchrun = $(which torchrun)"
 
-CONFIG_PATH="config/precomputed_embedding_train_shuffle_v2.yaml"
+CONFIG_PATH="config/precomputed_embedding_train_shuffle_v2_projwarmup.yaml"
 RUN_PY="run.py"
 
 NPROC_PER_NODE=8
 MASTER_PORT=16669
 
 # Default per-rank micro-batch + gradient accumulation. Effective per-rank
-# batch size = train_batch_size * accumulation_steps = 64 (matches the
-# yaml's effective bs=32 once world_size and accumulation are factored in,
-# i.e. 8 * 8 micro-batches per optimizer step on each rank).
+# batch size = train_batch_size * accumulation_steps = 32 (matches the
+# yaml's effective bs=32 once accumulation is factored in; 32 * 8 ranks
+# = 256 users per global optimizer step, identical to the yaml's
+# bs=32 / accum=1 baseline).
 #
-# History: bs was previously 4 to sidestep a cuBLAS Lt SIGFPE on the first
-# backward through note_embedding_head ([64, 1536] reverse) when
-# train_batch_size >= 8. That trigger went away when user_output_dim was
-# raised 64 -> 512 (note_embedding_head reverse is now [512, 1536], not
-# the buggy [64, 1536] shape), so larger micro-batches are safe again.
-# bs=8 + accum=8 keeps effective batch large for stable NCE gradients
-# while leaving headroom for the longer max_seq_len=200 KV-cache footprint.
-# Override via --data.train_batch_size / --training.accumulation_steps
-# in "$@" (run.py applies extra args in order; later occurrence wins).
-train_batch_size=8
+# Why bs=4 (NOT bs=8): cuBLAS Lt has a SIGFPE bug that fires whenever
+# train_batch_size >= 8 under ZeRO-3 + bf16-mixed.
+#
+# History:
+#   * The bug was originally diagnosed as "first backward through
+#     note_embedding_head with reverse shape == [64, 1536]" -- i.e.
+#     thought to be specific to user_output_dim=64. Once user_output_dim
+#     was raised to 512 (note_embedding_head reverse becomes [512, 1536])
+#     we tried bumping train_batch_size to 8, expecting the trigger to
+#     be gone.
+#   * That run crashed on all 8 ranks with exitcode -8 (Signal 8 = SIGFPE).
+#     faulthandler's stack ended in torch/nn/modules/linear.py forward,
+#     INSIDE the Qwen trunk on the FIRST forward of the first batch --
+#     not in backward, and not in note_embedding_head. So the SIGFPE
+#     trigger is the bs >= 8 boundary itself (a cuBLAS Lt bf16 batched
+#     matmul heuristic under ZeRO-3 partitioning), independent of
+#     note_embedding_head shape.
+#   * Reverting to bs=4 immediately fixed the crash.
+#
+# Do NOT raise train_batch_size to 8+ again unless cuBLAS / PyTorch /
+# DeepSpeed have been upgraded AND the SIGFPE has been verified gone in
+# a controlled rerun. The contrastive signal does not need it: per-step
+# negatives = bs * neg_samples_per_gpu * world_size = 4 * 512 * 8 = 16k,
+# already far above what InfoNCE needs in this regime.
+# Override at the CLI via --data.train_batch_size /
+# --training.accumulation_steps in "$@" (run.py applies extra args in
+# order; later occurrence wins).
+train_batch_size=4
 accumulation_steps=8
 
 if [[ "${DEBUG:-}" == "1" ]]; then
