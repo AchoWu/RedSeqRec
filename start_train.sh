@@ -23,18 +23,20 @@ NPROC_PER_NODE=8
 MASTER_PORT=16669
 
 # Default per-rank micro-batch + gradient accumulation. Effective per-rank
-# batch size = train_batch_size * accumulation_steps = 32 (matches the yaml).
+# batch size = train_batch_size * accumulation_steps = 64 (matches the
+# yaml's effective bs=32 once world_size and accumulation are factored in,
+# i.e. 8 * 8 micro-batches per optimizer step on each rank).
 #
-# Why bs=4 instead of bs=32: cuBLAS Lt has a SIGFPE bug on the first backward
-# through note_embedding_head ([64,1536] reverse) when train_batch_size >= 8.
-# bs=4 sidesteps the buggy heuristic. The contrastive signal is unaffected:
-# REDRecPrecomputedEmbeddingDataset samples `neg_samples_per_gpu` (default 512)
-# random negatives from the full item pool per row, so per-step negatives are
-# bs * neg_samples_per_gpu * world_size = 16k @ bs=4/8-rank, still far above
-# the in-batch baseline. Override via --data.train_batch_size /
-# --training.accumulation_steps in "$@" if cuBLAS is fixed (run.py applies
-# extra args in order; later occurrence wins).
-train_batch_size=4
+# History: bs was previously 4 to sidestep a cuBLAS Lt SIGFPE on the first
+# backward through note_embedding_head ([64, 1536] reverse) when
+# train_batch_size >= 8. That trigger went away when user_output_dim was
+# raised 64 -> 512 (note_embedding_head reverse is now [512, 1536], not
+# the buggy [64, 1536] shape), so larger micro-batches are safe again.
+# bs=8 + accum=8 keeps effective batch large for stable NCE gradients
+# while leaving headroom for the longer max_seq_len=200 KV-cache footprint.
+# Override via --data.train_batch_size / --training.accumulation_steps
+# in "$@" (run.py applies extra args in order; later occurrence wins).
+train_batch_size=8
 accumulation_steps=8
 
 if [[ "${DEBUG:-}" == "1" ]]; then

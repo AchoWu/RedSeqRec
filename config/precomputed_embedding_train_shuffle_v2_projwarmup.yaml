@@ -1,0 +1,202 @@
+data:
+  dataset_type: precomputed_embedding
+  # Train jsonl: pre-shuffled V0-style file (history items carry seq / pos / hardneg labels).
+  precomputed_user_history_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  # Memmap embedding dir (cids.npy + embeddings.bin + meta.json), 3.25M items, 512-dim.
+  precomputed_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+
+  # ---- training target / input strategy ----
+  # 'pos_random_seq_input' = input <- items with label=='seq', target <- random
+  # one of items with label=='pos'. Designed for the V0-style jsonl above.
+  simple_target_strategy: pos_random_seq_input
+  precomputed_positive_label: pos
+  precomputed_input_seq_label: seq
+  precomputed_sample_lastn: true
+  precomputed_min_history_len: 4
+  precomputed_loop_forever: true
+  precomputed_max_lines: null
+  precomputed_stats_interval: 10000
+
+  # ---- v0-aligned online eval block ----
+  # Aligned with the v0 reference run
+  # (/apdcephfs_gy4/share_303218624/jingweidong/output/logs/nohup_20260602_114853.log)
+  # so the user set + recall metrics are directly comparable:
+  #   * v0_eval_jsonl: same test.shuffled.jsonl
+  #   * eval_users=50000, stride = total_lines // eval_users = 200000/50000 = 4,
+  #     i.e. line_no in {0, 4, 8, ...}, exactly the same 50k users as v0.
+  #   * eval_target_strategy='all': for each user emit one eval sample per pos,
+  #     yielding the same ~612309 eval samples as the v0 reference run.
+  # NOTE on max_seq_len: kept at 200 to fully match the v0 reference run
+  # (same eval samples, same input length used for redrec user embedding,
+  # same user pool). This also dictates the train-time history length, so
+  # train_batch_size below has been halved from 64 -> 32 to absorb the
+  # ~2x KV-cache footprint per sequence.
+  v0_eval_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/test.shuffled.jsonl
+  seq_label: seq
+  positive_label: pos
+  eval_users: 50000
+  eval_target_strategy: all
+  max_seq_len: 200
+  min_history_len: 4
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  # ---- batching / negatives ----
+  # bs=32 (halved from 64) to absorb the ~2x KV-cache footprint of
+  # max_seq_len=200 (vs 96 previously). Per-step user count remains
+  # 32 * 8 = 256 across 8 GPUs.
+  train_batch_size: 32
+  # Global neg pool target = 4096; per-GPU = 4096 / world_size (=8) = 512.
+  # The model's forward_precomputed_embedding all-gathers neg_emb across ranks,
+  # so effective negatives = neg_samples_per_gpu * world_size.
+  neg_samples_per_gpu: 512
+  neg_pool_size_per_gpu: 1000000
+
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+  train_num_workers: 8
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  # Same 1536 -> 512 user-tower head as the main shuffle_v2 run (see that
+  # config for the rationale on dropping the 64-d bottleneck).
+  user_output_dim: 512
+  user_final_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # Single-query, single-target retrieval.
+  window_pos: 1
+  query_nums: 1
+
+# =============================================================================
+# Projector warmup phase: freeze the entire user_llm trunk and only train the
+# adapter modules sandwiching it -- input_embedding_projector (512 -> 1536),
+# note_embedding_head (1536 -> 512), self.query (1 x 1536 learnable token), and
+# the InfoNCE temperature logit_scale. This lets the from-scratch / loaded
+# parent ckpt's projectors align to Qwen2.5's input/output spaces under a much
+# larger LR, before stage 2 unfreezes the LLM at the usual small LR.
+#
+# trainer.py:106-124 picks up this `freeze_prefix` and calls _freeze_params,
+# which sets requires_grad=False on every param whose name startswith() any
+# entry. 'user_llm' matches user_llm.* (the full Qwen trunk + lm_head etc.).
+# =============================================================================
+freeze_prefix:
+  - 'user_llm'
+
+training:
+  target: homefeed
+  optim_args:
+    # Adapter-only training: ~few-M params, all either freshly initialized
+    # (input_embedding_projector, output-head pieces missing from the parent
+    # ckpt) or otherwise needing to recover after the user_output_dim 64->512
+    # change. 1e-3 is the value that worked for the v0_aligned stage1 run
+    # (also adapter-only; see precomputed_embedding_train_v0aligned_stage1.yaml).
+    # No lr_mult_prefix block: with user_llm frozen, every trainable param is
+    # already an adapter, so a single LR keeps the warmup phase simple.
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    # Bumped 400 -> 500 (matches v0_aligned stage1) to stabilize the much
+    # larger 1e-3 LR over the first few hundred steps.
+    warmup_steps: 500
+
+  # Online recall eval cadence (uses test.shuffled.jsonl + the same memmap pool).
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+
+  # ckpt cadence aligned to eval cadence.
+  eval_step: 1000
+  save_step: 1000
+  # Bumped 3 -> 5: with total_step=15000 we get ~15 eval-driven saves over
+  # the run, and we want enough headroom around the plateau region to keep
+  # candidate ckpts for stage 2 (the next phase loads the best one as
+  # load_pretrained_model). The final-step ckpt is preserved unconditionally
+  # in addition to these 5.
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  # Projector-only warmup: extended to 100000 to give a generous LR-decay
+  # tail and avoid prematurely cutting off the plateau hunt. Adapter is
+  # wider than the v0_aligned stage1 run (note_embedding_head now outputs
+  # 1536 -> 512 instead of 1536 -> 64, more from-scratch capacity to
+  # absorb), so we expect plateau somewhere in the 15k-30k range, well
+  # before 100k. Under cosine decay over 100k with warmup_steps=500, LR
+  # at step 20k is still ~0.97x peak (~9.7e-4) and at step 50k is ~0.50x
+  # peak; the schedule does NOT artificially flatten loss in the relevant
+  # window.
+  #
+  # IMPORTANT: this is a manual-early-stop run. Watch redrec.top500_recall
+  # in the rank-0 log; once it flatlines across 2-3 consecutive evals
+  # (each 1000 steps), Ctrl+C the job. The top-K pruner will already
+  # have the best ckpt on disk, and the unfreezing stage 2 will start
+  # from that ckpt, not from this final-step ckpt. Do NOT let the run
+  # actually reach 100000 -- that wastes 70k+ steps of dry training.
+  total_step: 100000
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: true
+  # Same starting weights as the full-train shuffle_v2 run.
+  load_pretrained_model: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/pytorch_model.bin
+
+saver:
+  v0_style: true
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  # Distinct run name so this projector-warmup run lands under its own
+  # timestamped subdir and doesn't collide with the full-train shuffle_v2 ckpts.
+  saved_model_name: precomputed_shuffle_user_tower_v2_projwarmup
+
+eval:
+  target: homefeed
+  model_path: expr/precomputed_shuffle_user_tower_v2_projwarmup/checkpoint-100000/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 96
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false
