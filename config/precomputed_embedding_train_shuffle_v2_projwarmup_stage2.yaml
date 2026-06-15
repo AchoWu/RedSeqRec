@@ -1,0 +1,230 @@
+data:
+  dataset_type: precomputed_embedding
+  # Train jsonl: pre-shuffled V0-style file (history items carry seq / pos / hardneg labels).
+  precomputed_user_history_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/train.shuffled.jsonl
+  # Memmap embedding dir (cids.npy + embeddings.bin + meta.json), 3.25M items, 512-dim.
+  precomputed_embedding_dir: /apdcephfs_gy4/share_303218624/jingweidong/embeddings/preprocessed
+
+  # ---- training target / input strategy ----
+  simple_target_strategy: pos_random_seq_input
+  precomputed_positive_label: pos
+  precomputed_input_seq_label: seq
+  precomputed_sample_lastn: true
+  precomputed_min_history_len: 4
+  precomputed_loop_forever: true
+  precomputed_max_lines: null
+  precomputed_stats_interval: 10000
+
+  # ---- v0-aligned online eval block (identical to stage 1 so the recall
+  # curve is directly comparable across the two stages) ----
+  v0_eval_jsonl: /apdcephfs_gy4/share_303218624/jingweidong/user_last/test.shuffled.jsonl
+  seq_label: seq
+  positive_label: pos
+  eval_users: 50000
+  eval_target_strategy: all
+  max_seq_len: 200
+  min_history_len: 4
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  # ---- batching / negatives ----
+  # Same yaml-side bs=32 as the full-train baseline. start_train.sh overrides
+  # this with --data.train_batch_size 4 + --training.accumulation_steps 8 to
+  # sidestep the cuBLAS Lt SIGFPE that fires at micro-batch >= 8 under
+  # ZeRO-3 + bf16-mixed (see start_train.sh header for the full debug log).
+  # Effective per-rank batch is 4 * 8 = 32 either way.
+  train_batch_size: 32
+  neg_samples_per_gpu: 512
+  neg_pool_size_per_gpu: 1000000
+
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+  train_num_workers: 8
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 512
+  # Same 1536 -> 512 user-tower head as stage 1; output_mlp degrades to
+  # nn.Identity. The stage-1 ckpt loaded below was trained at this width,
+  # so this MUST match or load_state_dict will skip key tensors.
+  user_output_dim: 512
+  user_final_dim: 512
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # Single-query, single-target retrieval.
+  window_pos: 1
+  query_nums: 1
+
+# =============================================================================
+# Stage 2: full unfreeze. user_llm trunk is now trainable jointly with the
+# adapter. NO freeze_prefix block here -- the absence of the key tells
+# trainer.py:106-124 to skip the freeze pass, so requires_grad stays True
+# everywhere.
+#
+# Why this is safe to do now (vs starting from scratch with everything
+# unfrozen): stage 1 ran the projector-only warmup to convergence; the
+# loaded ckpt below has well-aligned input_embedding_projector,
+# note_embedding_head, query, and logit_scale. Unfreezing the LLM here
+# starts from a state where adapter-side gradients are small and stable,
+# which is the standard "warm the adapter, then joint fine-tune" recipe.
+#
+# At plateau stage 1 hit redrec.top500_recall = 0.0953 vs the strongest
+# pooling baseline (last8_pool) 0.0582 -- a +64% lift, but stage-1 top1
+# is still well below last_pool's top1 (0.0093 vs 0.0326). Closing the
+# top1 gap is exactly what unfreezing the LLM is for: short-term-intent
+# matching needs the trunk to learn it, not just the adapter.
+# =============================================================================
+
+training:
+  target: homefeed
+  optim_args:
+    # Single LR for the entire model (LLM trunk + adapter). 1e-5 is the
+    # value the original full-train shuffle_v2.yaml uses for joint
+    # training, and is small enough to gently fine-tune Qwen2.5-1.5B
+    # without clobbering its pretrained features in the early steps.
+    #
+    # Why NO lr_mult_prefix block here (i.e. why adapter does NOT get
+    # 10x):
+    #   * Stage 1 ran the projector-only warmup to convergence over 99k
+    #     steps; the adapter is already sitting in (or extremely near)
+    #     its local optimum given a frozen LLM (top500_recall plateaued
+    #     at 0.0953 with <1e-4 std across the last 9 evals).
+    #   * The cosine schedule on stage 1 decayed adapter LR to ~1e-6 by
+    #     the end. Jumping straight to 1e-4 (10x global LR) here would
+    #     mean a ~100x effective amplification on weights that just
+    #     stabilized -- much more likely to *break* the converged
+    #     adapter than to improve it.
+    #   * The thing stage 2 is supposed to fix (top1 lagging behind
+    #     last_pool's 0.0326) is fundamentally a trunk problem -- it
+    #     needs the LLM to learn short-term-intent matching, not the
+    #     adapter to learn it harder. Letting the LLM lead at 1e-5 with
+    #     the adapter quietly co-adapting at the same rate is a cleaner
+    #     setup than forcing the adapter to keep up with a 10x signal.
+    #   * Co-adapting under the same LR also keeps the adapter from
+    #     racing ahead of the trunk and re-introducing the
+    #     "adapter-only" optimum stage 1 already explored.
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    # 2000 / 100000 = 2% warmup. Picked by ratio, not by "500 -> 2x":
+    #   * v0_aligned stage 2 template uses 600 / 30000 = 2% as a known-
+    #     working precedent for "first time unfreezing the LLM trunk".
+    #     Matching the ratio rather than the absolute number keeps us
+    #     consistent with that template at our longer 100k budget.
+    #   * Stage 1's 500-step warmup was sized for an adapter-only run
+    #     (~few-M params, Adam m/v estimates stabilize fast). Stage 2
+    #     unfreezes ~1.5B Qwen2.5 params with all-new optimizer state,
+    #     so the second moment needs more steps to settle before LR
+    #     reaches its peak; under-warming is the cheapest way to clobber
+    #     pretrained features.
+    #   * Do NOT push warmup beyond ~5k (5%) -- past that, the average
+    #     LR over the early window drops too low and the time to first
+    #     observable lift in redrec.top1_recall (the metric stage 2 is
+    #     supposed to fix) gets pushed out unnecessarily.
+    warmup_steps: 5000
+
+  # Online recall eval cadence -- same 1000-step interval as stage 1, so
+  # the two recall curves can be concatenated end-to-end.
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+
+  # Save every 2000 steps (stage 1 was every 1000). At 100k total + ckpt
+  # files of a 1.5B Qwen trunk, save_step=1000 fills disk fast; 2000 still
+  # gives 50 candidates over the run, plenty for the top-K=5 pruner.
+  eval_step: 1000
+  save_step: 1000
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+
+  # Projector warmup -> joint fine-tune: total_step=100000 mirrors stage 1
+  # both for budget alignment and so the cosine schedule has the same
+  # tail shape (LR at step 50k is ~0.50x peak; at step 80k ~0.10x peak).
+  #
+  # IMPORTANT: this is a MANUAL-EARLY-STOP run (same as stage 1). Stage 2
+  # is sample-efficient because both the trunk (Qwen pretraining) and the
+  # adapter (stage 1) start warm; recall typically plateaus at 15k-25k
+  # steps for this kind of joint fine-tune. Watch redrec.top500_recall
+  # AND redrec.top1_recall -- the latter is what we expect to actually
+  # close the gap to last_pool. Ctrl+C once both flatline across 2-3
+  # consecutive evals.
+  total_step: 100000
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: true
+
+  # === STAGE-1 CKPT TO LOAD ===
+  # MUST be filled in before launching this yaml. run.py auto-detects:
+  # a directory is loaded via load_state_dict_from_zero_checkpoint
+  # (~25 min for Qwen2.5-1.5B); a single .bin file via torch.load
+  # (~13 min after pre-converting with utils/zero_to_fp32.py).
+  # The expected stage-1 path shape is:
+  #   <output_dir>/precomputed_shuffle_user_tower_v2_projwarmup_<RUN_TS>/checkpoint-<step>/
+  # Best-recall ckpt from the just-finished stage 1 (top500=0.0953):
+  #   .../precomputed_shuffle_user_tower_v2_projwarmup_20260611_105332/checkpoint-99001/
+  # but DO NOT hard-code it here -- if you re-run stage 1 the timestamp
+  # changes. Replace <FILL_STAGE1_BEST_CKPT> below with the actual path
+  # before launching, or pass --training.load_pretrained_model on the CLI.
+  load_pretrained_model: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/precomputed_shuffle_user_tower_v2_projwarmup_20260611_105332/checkpoint-94001
+
+saver:
+  v0_style: true
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  # Distinct run name so this stage 2 run lands under its own timestamped
+  # subdir and does NOT collide with any stage 1 run output tree.
+  saved_model_name: precomputed_shuffle_user_tower_v2_projwarmup_stage2
+
+eval:
+  target: homefeed
+  model_path: expr/precomputed_shuffle_user_tower_v2_projwarmup_stage2/checkpoint-100000/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 96
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false
