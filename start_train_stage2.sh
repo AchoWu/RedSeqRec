@@ -83,3 +83,5 @@ else
       --training.accumulation_steps "${accumulation_steps}" \
       "$@"
 fi
+
+python3 test_gpu.py
