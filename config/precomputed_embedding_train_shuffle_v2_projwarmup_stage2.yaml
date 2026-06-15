@@ -185,18 +185,23 @@ training:
   gradient_checkpointing: true
 
   # === STAGE-1 CKPT TO LOAD ===
-  # MUST be filled in before launching this yaml. run.py auto-detects:
-  # a directory is loaded via load_state_dict_from_zero_checkpoint
-  # (~25 min for Qwen2.5-1.5B); a single .bin file via torch.load
-  # (~13 min after pre-converting with utils/zero_to_fp32.py).
-  # The expected stage-1 path shape is:
-  #   <output_dir>/precomputed_shuffle_user_tower_v2_projwarmup_<RUN_TS>/checkpoint-<step>/
-  # Best-recall ckpt from the just-finished stage 1 (top500=0.0953):
-  #   .../precomputed_shuffle_user_tower_v2_projwarmup_20260611_105332/checkpoint-99001/
-  # but DO NOT hard-code it here -- if you re-run stage 1 the timestamp
-  # changes. Replace <FILL_STAGE1_BEST_CKPT> below with the actual path
-  # before launching, or pass --training.load_pretrained_model on the CLI.
-  load_pretrained_model: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/precomputed_shuffle_user_tower_v2_projwarmup_20260611_105332/checkpoint-94001
+  # Pre-converted to a single fp32 .bin file via utils/zero_to_fp32.py:
+  #   python utils/zero_to_fp32.py \
+  #     <ckpt_dir>/checkpoint-94001 \
+  #     <ckpt_dir>/checkpoint-94001/pytorch_model.bin
+  # On a successful conversion zero_to_fp32 reports:
+  #   Frozen    fp32 state dict: 338 params,  1,543,714,304 elems  (= user_llm,
+  #                                                                  Qwen2.5-1.5B)
+  #   Trainable fp32 state dict:  13 params,      1,844,737 elems  (= adapter:
+  #                                                                  input_embedding_projector,
+  #                                                                  note_embedding_head, query,
+  #                                                                  logit_scale)
+  # run.py auto-detects:
+  #   * file path -> torch.load (~13 min for 1.5B Qwen2.5)
+  #   * directory -> load_state_dict_from_zero_checkpoint (~25 min, sharded)
+  # Pointing at the .bin file here cuts cold-start by ~12 min vs the
+  # raw zero-sharded ckpt directory.
+  load_pretrained_model: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/precomputed_shuffle_user_tower_v2_projwarmup_20260611_105332/checkpoint-94001/pytorch_model.bin
 
 saver:
   v0_style: true
