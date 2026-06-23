@@ -134,7 +134,7 @@ training:
 
   scheduler_args:
     type: cosine
-    # 2000 / 100000 = 2% warmup. Picked by ratio, not by "500 -> 2x":
+    # 2000 / 100000 = 2% warmup. Sized by ratio rather than absolute step:
     #   * v0_aligned stage 2 template uses 600 / 30000 = 2% as a known-
     #     working precedent for "first time unfreezing the LLM trunk".
     #     Matching the ratio rather than the absolute number keeps us
@@ -145,11 +145,19 @@ training:
     #     so the second moment needs more steps to settle before LR
     #     reaches its peak; under-warming is the cheapest way to clobber
     #     pretrained features.
+    #   * Earlier this yaml shipped with warmup_steps=5000 (5%, the
+    #     standard LLM-SFT safety margin) for the first stage-2 launch,
+    #     and that run started cleanly: step=1000 recall = stage-1
+    #     plateau, no feature destruction. Walking it back to 2000
+    #     (2%) for subsequent reruns to bring peak LR forward by ~3k
+    #     steps and shorten the time to first observable trunk lift on
+    #     redrec.top1_recall. 5% turned out to be conservative for our
+    #     stage-1-warmed adapter; 2% is enough.
     #   * Do NOT push warmup beyond ~5k (5%) -- past that, the average
     #     LR over the early window drops too low and the time to first
     #     observable lift in redrec.top1_recall (the metric stage 2 is
     #     supposed to fix) gets pushed out unnecessarily.
-    warmup_steps: 5000
+    warmup_steps: 2000
 
   # Online recall eval cadence -- same 1000-step interval as stage 1, so
   # the two recall curves can be concatenated end-to-end.
