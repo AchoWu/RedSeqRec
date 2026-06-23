@@ -1,0 +1,197 @@
+data:
+  dataset_type: precomputed_embedding
+  # ===== 64-d input data =====
+  # PLACEHOLDER: point at the new 64-dim user-history jsonl when ready.
+  # Same V0-style format as the 512-d run (each item carries seq/pos/hardneg
+  # labels), only the precomputed embedding dim changes.
+  precomputed_user_history_jsonl: <FILL_64D_TRAIN_JSONL>
+  # PLACEHOLDER: memmap dir for the 64-d item pool. Layout must match the
+  # 512-d version (cids.npy + embeddings.bin + meta.json), with meta.json
+  # saying "embed_dim": 64.
+  precomputed_embedding_dir: <FILL_64D_EMBEDDING_DIR>
+
+  # ---- training target / input strategy ----
+  simple_target_strategy: pos_random_seq_input
+  precomputed_positive_label: pos
+  precomputed_input_seq_label: seq
+  precomputed_sample_lastn: true
+  precomputed_min_history_len: 4
+  precomputed_loop_forever: true
+  precomputed_max_lines: null
+  precomputed_stats_interval: 10000
+
+  # ---- v0-aligned online eval block (identical to stage 1 so the recall
+  # curve is directly comparable across the two stages) ----
+  v0_eval_jsonl: <FILL_64D_EVAL_JSONL>
+  seq_label: seq
+  positive_label: pos
+  eval_users: 50000
+  eval_target_strategy: all
+  max_seq_len: 200
+  min_history_len: 4
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  # ---- batching / negatives ----
+  # Same yaml-side bs=32 as the 512-d run. start_train_stage2.sh overrides
+  # this with --data.train_batch_size 4 + --training.accumulation_steps 8
+  # to sidestep the cuBLAS Lt SIGFPE that fires at micro-batch >= 8 under
+  # ZeRO-3 + bf16-mixed. Effective per-rank batch is 4 * 8 = 32 either way.
+  train_batch_size: 32
+  neg_samples_per_gpu: 512
+  neg_pool_size_per_gpu: 1000000
+
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+  train_num_workers: 8
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  # === 64-d topology (must MATCH the stage-1 yaml or the loaded stage-1
+  # ckpt below will have shape-mismatched adapter tensors filtered out
+  # and the adapter will silently restart from random) ===
+  # Input adapter:  Linear(64 -> 1536) + GELU + LayerNorm(1536)
+  # Output adapter: ProjectionHead(1536 -> 64, residual + LN)
+  # output_mlp: nn.Identity.
+  precomputed_input_dim: 64
+  user_output_dim: 64
+  user_final_dim: 64
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # Single-query, single-target retrieval.
+  window_pos: 1
+  query_nums: 1
+
+# =============================================================================
+# Stage 2: full unfreeze. user_llm trunk is now trainable jointly with the
+# adapter. NO freeze_prefix block here -- the absence of the key tells
+# trainer.py:106-124 to skip the freeze pass, so requires_grad stays True
+# everywhere.
+#
+# Why this is safe to do now (vs starting from scratch with everything
+# unfrozen): stage 1 (the 64-d projector warmup) trains the from-scratch
+# input_embedding_projector and note_embedding_head with the LLM frozen,
+# producing adapter weights that already map the 64-d item space to/from
+# Qwen2.5's 1536-d hidden. Unfreezing the LLM here starts from a state
+# where adapter-side gradients are small and stable.
+# =============================================================================
+
+training:
+  target: homefeed
+  optim_args:
+    # Single LR for the entire model (LLM trunk + adapter). 1e-5 matches
+    # the 512-d stage-2 recipe: small enough to gently fine-tune Qwen2.5
+    # without clobbering pretrained features, large enough for adapter
+    # to keep co-adapting at the same rate (no lr_mult_prefix block --
+    # the rationale is the same as the 512-d run: the adapter just
+    # finished stage 1 with cosine-decayed LR near zero, so a 10x jump
+    # would be ~100x effective amplification on weights that just
+    # stabilized).
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    # 2000 / 100000 = 2% warmup, matching the post-revision 512-d stage 2
+    # yaml. v0_aligned_stage2 also uses 600/30000 = 2% as the canonical
+    # ratio for "first time unfreezing the LLM".
+    warmup_steps: 2000
+
+  # Online recall eval cadence -- same 1000-step interval as stage 1 so
+  # the two recall curves can be concatenated end-to-end.
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+
+  # ckpt cadence aligned to eval cadence.
+  eval_step: 1000
+  save_step: 1000
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+
+  # Joint fine-tune budget: total_step=100000 mirrors stage 1 both for
+  # budget alignment and so the cosine schedule has the same tail shape.
+  # As with the 512-d stage 2, this is a MANUAL-EARLY-STOP run -- watch
+  # both redrec.top500_recall and redrec.top1_recall; Ctrl+C once both
+  # flatline across 2-3 consecutive evals. The 64-d item space has lower
+  # representational capacity than 512-d, so the absolute recall numbers
+  # are expected to be LOWER than the 512-d baselines; do not compare
+  # numbers cross-dimension, only judge plateau within this run.
+  total_step: 100000
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: true
+
+  # === STAGE-1 CKPT TO LOAD ===
+  # PLACEHOLDER: fill in the best-recall ckpt from the 64-d stage-1 run
+  # before launching this yaml. The expected shape is:
+  #   <output_dir>/precomputed_shuffle_user_tower_v2_projwarmup_64d_<RUN_TS>/checkpoint-<step>/
+  # Optionally pre-convert via utils/zero_to_fp32.py for faster cold
+  # start (~13 min via torch.load on a single .bin vs ~25 min for the
+  # raw zero-sharded directory):
+  #   python utils/zero_to_fp32.py \
+  #     <ckpt_dir> \
+  #     <ckpt_dir>/pytorch_model.bin
+  # run.py auto-detects: file path -> torch.load, directory -> deepspeed
+  # zero load.
+  load_pretrained_model: <FILL_STAGE1_64D_BEST_CKPT>
+
+saver:
+  v0_style: true
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  # Distinct run name so the 64-d stage-2 run lands under its own
+  # timestamped subdir and doesn't collide with the 512-d run tree.
+  saved_model_name: precomputed_shuffle_user_tower_v2_projwarmup_64d_stage2
+
+eval:
+  target: homefeed
+  model_path: expr/precomputed_shuffle_user_tower_v2_projwarmup_64d_stage2/checkpoint-100000/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 96
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false

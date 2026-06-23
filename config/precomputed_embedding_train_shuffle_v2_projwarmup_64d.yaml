@@ -1,0 +1,218 @@
+data:
+  dataset_type: precomputed_embedding
+  # ===== 64-d input data =====
+  # PLACEHOLDER: point at the new 64-dim user-history jsonl when ready.
+  # Same V0-style format as the 512-d run (each item carries seq/pos/hardneg
+  # labels), only the precomputed embedding dim changes.
+  precomputed_user_history_jsonl: <FILL_64D_TRAIN_JSONL>
+  # PLACEHOLDER: memmap dir for the 64-d item pool. Layout must match the
+  # 512-d version:
+  #   <dir>/
+  #     ├── cids.npy        # int item ids, shape [N]
+  #     ├── embeddings.bin  # fp32 row-major, shape [N, 64]
+  #     └── meta.json       # {"num_items": N, "embed_dim": 64, "dtype": "float32"}
+  # REDRecPrecomputedEmbeddingDataset reads embed_dim out of meta.json, so
+  # as long as meta.json says 64 and precomputed_input_dim below is 64,
+  # the data and model agree.
+  precomputed_embedding_dir: <FILL_64D_EMBEDDING_DIR>
+
+  # ---- training target / input strategy ----
+  # 'pos_random_seq_input' = input <- items with label=='seq', target <- random
+  # one of items with label=='pos'. Designed for the V0-style jsonl above.
+  simple_target_strategy: pos_random_seq_input
+  precomputed_positive_label: pos
+  precomputed_input_seq_label: seq
+  precomputed_sample_lastn: true
+  precomputed_min_history_len: 4
+  precomputed_loop_forever: true
+  precomputed_max_lines: null
+  precomputed_stats_interval: 10000
+
+  # ---- v0-aligned online eval block ----
+  # Same eval protocol as the 512-d run (50k users, all-pos targets,
+  # max_seq_len=200). The eval jsonl must point at the test split of the
+  # *same* dataset family as precomputed_user_history_jsonl above, otherwise
+  # train/eval distributions diverge.
+  v0_eval_jsonl: <FILL_64D_EVAL_JSONL>
+  seq_label: seq
+  positive_label: pos
+  eval_users: 50000
+  eval_target_strategy: all
+  max_seq_len: 200
+  min_history_len: 4
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+
+  # ---- batching / negatives ----
+  # Same yaml-side bs=32 as the 512-d run. start_train.sh overrides this
+  # with --data.train_batch_size 4 + --training.accumulation_steps 8 to
+  # sidestep the cuBLAS Lt SIGFPE that fires at micro-batch >= 8 under
+  # ZeRO-3 + bf16-mixed (see start_train.sh header for the full debug log).
+  # Effective per-rank batch is 4 * 8 = 32 either way.
+  train_batch_size: 32
+  # Global neg pool target = 4096; per-GPU = 4096 / world_size (=8) = 512.
+  neg_samples_per_gpu: 512
+  neg_pool_size_per_gpu: 1000000
+
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+  train_num_workers: 8
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  # === 64-d topology ===
+  # Input adapter shape:  Linear(64 -> 1536) + GELU + LayerNorm(1536)
+  # Output adapter shape: ProjectionHead(1536 -> 64, with residual + LN)
+  # output_mlp: nn.Identity (since user_output_dim == user_final_dim == 64,
+  #   redrec.py:236-244 picks the Identity branch).
+  precomputed_input_dim: 64
+  user_output_dim: 64
+  user_final_dim: 64
+  use_ft_flash_attn: true
+  use_lora: false
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # Single-query, single-target retrieval.
+  window_pos: 1
+  query_nums: 1
+
+# =============================================================================
+# Projector warmup phase: freeze the entire user_llm trunk and only train the
+# adapter modules sandwiching it:
+#   * input_embedding_projector (Linear 64 -> 1536, GELU, LayerNorm)
+#   * note_embedding_head       (ProjectionHead 1536 -> 64, residual + LN)
+#   * self.query                (1 x 1536 learnable token)
+#   * logit_scale               (scalar NCE temperature)
+# This lets the from-scratch projectors align to Qwen2.5's input/output
+# spaces under a much larger LR, before stage 2 unfreezes the LLM at the
+# usual small LR. trainer.py:106-124 reads `freeze_prefix` and calls
+# _freeze_params, which sets requires_grad=False on every param whose name
+# starts with any entry. 'user_llm' matches user_llm.* (the full Qwen
+# trunk + lm_head etc.).
+#
+# NOTE on the 1536 -> 64 output head shape: this is the same direction
+# the original Red-Mmu-Rec parent ckpt used. The cuBLAS Lt SIGFPE
+# warning in CLAUDE.md mentioned the [64, 1536] reverse shape, but the
+# 512-d run's SIGFPE crash was traced to the train_batch_size >= 8
+# boundary itself (not head shape) -- with bs=4 the crash did NOT
+# reproduce on 1536 -> 512. We have NOT verified bs=4 + 1536 -> 64 is
+# safe, but we believe the bs boundary is the only real trigger.
+# Fallback if SIGFPE reappears on this 64-d head: set
+#   user_output_dim: 512   # keep note_embedding_head reverse at [512, 1536]
+#   user_final_dim:  64    # output_mlp auto-builds Linear(512,128)+GELU+Linear(128,64)+LN
+# which lands user output at 64 while keeping the 512-d reverse shape.
+# =============================================================================
+freeze_prefix:
+  - 'user_llm'
+
+training:
+  target: homefeed
+  optim_args:
+    # Adapter-only training: input_embedding_projector (~0.1M params),
+    # note_embedding_head (~0.13M params), query (1.5K), logit_scale (1).
+    # All freshly initialized (or carried from the 512-d run, which we
+    # are intentionally NOT loading here since the user requested a
+    # clean restart). 1e-3 matches the 512-d projector-warmup recipe.
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    # 500 / 100000 = 0.5% warmup -- matches the 512-d stage-1 yaml's
+    # warmup_steps=500. The 64-d adapter has ~0.2M trainable params
+    # (input_embedding_projector + note_embedding_head + query + logit_scale)
+    # vs the 512-d run's ~1.85M, so Adam state stabilizes at least as
+    # fast as the 512-d stage 1 -- 500 steps is plenty. We do NOT match
+    # the stage-2 (joint fine-tune) warmup of 2000 here because that
+    # value exists to protect the 1.5B Qwen pretrained features when
+    # they are first unfrozen, which is irrelevant while user_llm is
+    # frozen in this projector-warmup phase.
+    warmup_steps: 500
+
+  # Online recall eval cadence (uses the 64-d test jsonl + the same memmap pool).
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+
+  # ckpt cadence aligned to eval cadence.
+  eval_step: 1000
+  save_step: 1000
+  # 5 ckpts kept by top500_recall; stage 2 loads the best one as
+  # load_pretrained_model. Final-step ckpt is preserved unconditionally
+  # in addition to these 5.
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  # Projector-only warmup: 100000 steps gives a generous LR-decay tail.
+  # 64-d adapter is smaller than the 512-d one (head is 1536->64 instead
+  # of 1536->512), so plateau is likely *earlier* in the 64-d run, maybe
+  # 10k-25k. As with the 512-d run, this is a MANUAL-EARLY-STOP run --
+  # watch redrec.top500_recall and Ctrl+C once it flatlines across 2-3
+  # consecutive evals.
+  total_step: 100000
+  strategy: deepspeed
+  stage: 3
+  gradient_checkpointing: true
+  # Same parent ckpt as the 512-d run -- Qwen2.5-1.5B trunk weights load
+  # fine regardless of input/output adapter shape (the shape-filtered
+  # load_state_dict in run.py skips the adapter weights from the parent
+  # because their dims don't match). Adapter modules then train from
+  # scratch under this stage-1 yaml.
+  load_pretrained_model: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Red-Mmu-Rec-Multiscene-Qwen2.5-1.5b/pytorch_model.bin
+
+saver:
+  v0_style: true
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  # Distinct run name so the 64-d projector-warmup run lands under its
+  # own timestamped subdir and doesn't collide with the 512-d run tree.
+  saved_model_name: precomputed_shuffle_user_tower_v2_projwarmup_64d
+
+eval:
+  target: homefeed
+  model_path: expr/precomputed_shuffle_user_tower_v2_projwarmup_64d/checkpoint-100000/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 96
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 1
+reproducibility: false
