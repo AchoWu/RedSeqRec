@@ -46,6 +46,12 @@ from logging import getLogger
 import numpy as np
 import torch
 
+# Schema-tolerant adapter shared with the train-side dataset, so train and
+# online eval interpret heterogeneous (flat 512-d / array-form 64-d) jsonl
+# records identically. See dataset.py top-of-module docstring for the
+# canonical description of both schemas and the split rule.
+from .dataset import normalize_history_record
+
 # ---------------------------------------------------------------------------
 # Embedding loader (memmap layout preferred; legacy dict-in-npy supported).
 # Lifted from RedSeqRecV0Simple/v0_simple/dataset.py to keep this module
@@ -258,6 +264,11 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         self.neg_samples_per_gpu = int(d.get('neg_samples_per_gpu', 400))
         self.stats_interval = int(d.get('precomputed_stats_interval', 10000))
 
+        # See dataset.py::normalize_history_record. Only applies when the
+        # input jsonl uses the array-form (64-d datav2) schema; flat
+        # (datav1) records ignore this value entirely.
+        self.pos_n_for_64d = int(d.get('precomputed_64d_pos_n', 10))
+
         # ---- load embeddings ----
         cids_or_arr, embeddings, cid2idx = load_v0_embeddings(emb_path)
         self.cids = cids_or_arr
@@ -415,7 +426,11 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
 
                     try:
                         rec = json.loads(line)
-                        input_cids, target_cid, _hn = self._select_window(rec.get('history', []))
+                        history = normalize_history_record(rec, pos_n=self.pos_n_for_64d)
+                        if history is None:
+                            skipped += 1
+                            continue
+                        input_cids, target_cid, _hn = self._select_window(history)
                         if input_cids is None:
                             skipped += 1
                             continue
@@ -492,6 +507,7 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
     min_history_len = int(d.get('min_history_len', 4))
     seq_label = str(d.get('seq_label', 'seq'))
     positive_label = str(d.get('positive_label', 'pos'))
+    pos_n_for_64d = int(d.get('precomputed_64d_pos_n', 10))
     eval_users = int(d.get('eval_users', 50000))
     strat = str(d.get('eval_target_strategy', 'all')).lower()
     if strat not in ('all', 'last', 'first'):
@@ -542,8 +558,12 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
             n_users_read += 1
             try:
                 rec = json.loads(line)
+                history = normalize_history_record(rec, pos_n=pos_n_for_64d)
+                if history is None:
+                    skipped += 1
+                    continue
                 seq_cids, pos_cids = [], []
-                for it in rec.get('history', []):
+                for it in history:
                     cid = it.get('cid')
                     if cid is None:
                         continue

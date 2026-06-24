@@ -1,20 +1,19 @@
 data:
   dataset_type: precomputed_embedding
   # ===== 64-d input data =====
-  # PLACEHOLDER: point at the new 64-dim user-history jsonl when ready.
-  # Same V0-style format as the 512-d run (each item carries seq/pos/hardneg
-  # labels), only the precomputed embedding dim changes.
-  precomputed_user_history_jsonl: <FILL_64D_TRAIN_JSONL>
-  # PLACEHOLDER: memmap dir for the 64-d item pool. Layout must match the
-  # 512-d version:
-  #   <dir>/
-  #     ├── cids.npy        # int item ids, shape [N]
-  #     ├── embeddings.bin  # fp32 row-major, shape [N, 64]
-  #     └── meta.json       # {"num_items": N, "embed_dim": 64, "dtype": "float32"}
-  # REDRecPrecomputedEmbeddingDataset reads embed_dim out of meta.json, so
-  # as long as meta.json says 64 and precomputed_input_dim below is 64,
-  # the data and model agree.
-  precomputed_embedding_dir: <FILL_64D_EMBEDDING_DIR>
+  # User-history jsonl. Format is the array-form (datav2) schema:
+  #   {"qimei36": "...", "content_ids": [c1, c2, ...], "event_times": [...], ...}
+  # The dataloader auto-detects this schema (see
+  # REDRec/data/dataset/dataset.py::normalize_history_record) and treats
+  # content_ids[:-precomputed_64d_pos_n] as input history,
+  # content_ids[-precomputed_64d_pos_n:] as target candidates.
+  precomputed_user_history_jsonl: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/user_latest/train.jsonl
+  # Memmap dir for the 64-d item pool. Same on-disk layout as the 512-d
+  # version (cids.npy + embeddings.bin + meta.json), with meta.json saying
+  # "embed_dim": 64. Pool itself is shared with all other 64-d runs --
+  # only the user-history jsonls (train / eval) differ between
+  # experiments.
+  precomputed_embedding_dir: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/preprocessed64d
 
   # ---- training target / input strategy ----
   # 'pos_random_seq_input' = input <- items with label=='seq', target <- random
@@ -33,7 +32,7 @@ data:
   # max_seq_len=200). The eval jsonl must point at the test split of the
   # *same* dataset family as precomputed_user_history_jsonl above, otherwise
   # train/eval distributions diverge.
-  v0_eval_jsonl: <FILL_64D_EVAL_JSONL>
+  v0_eval_jsonl: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/user_latest/test.jsonl
   seq_label: seq
   positive_label: pos
   eval_users: 50000

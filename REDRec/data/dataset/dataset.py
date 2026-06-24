@@ -16,6 +16,54 @@ from transformers import AutoTokenizer, AutoProcessor
 import datetime
 
 
+# -----------------------------------------------------------------------------
+# Schema-tolerant history adapter: normalize heterogeneous jsonl records into
+# the canonical v1-style ``history`` list of ``{"cid", "ts", "label"}`` dicts
+# the rest of the precomputed pipeline expects. Two recognized record shapes:
+#
+#   1. Flat 512-d schema (datav1):
+#        {"qimei36": ..., "history": [{"cid": ..., "ts": ..., "label": "seq"|"pos"}, ...]}
+#      Items already carry per-item label, so we return ``record['history']``
+#      unchanged.
+#
+#   2. Array-form 64-d schema (datav2):
+#        {"qimei36": ..., "content_ids": [c1, c2, ...], "event_times": [...],
+#         "actions": [...], "durations": [...], "busi_types": [...]}
+#      Items are a single time-ordered behavior log with NO per-item label and
+#      no pre-split history/target. The convention is ``content_ids[:-pos_n]``
+#      becomes ``label='seq'`` (input history), ``content_ids[-pos_n:]``
+#      becomes ``label='pos'`` (target candidates). ts is set to 0 since the
+#      pos_random_seq_input target strategy does not consult it (event_times
+#      strings would only add per-row datetime parse cost without changing
+#      sample selection).
+#
+# Naming uses ``64d`` rather than ``v2`` even though the actual discriminator
+# is the schema (presence of ``history`` vs ``content_ids``), because in this
+# project the array-form schema only ships with the 64-d item-pool data --
+# treating ``64d`` as the user-facing label keeps yaml config ergonomic
+# (``precomputed_64d_pos_n``) while still detecting the correct branch
+# automatically by record shape.
+#
+# Returns None if neither schema is recognized or the record does not have
+# enough items to split; callers should treat None as "skip this row".
+# -----------------------------------------------------------------------------
+def normalize_history_record(record, pos_n=10):
+    history = record.get('history', None)
+    if isinstance(history, list):
+        return history
+
+    content_ids = record.get('content_ids', None)
+    if isinstance(content_ids, list):
+        n = len(content_ids)
+        if pos_n <= 0 or n <= pos_n:
+            return None
+        seq_part = [{'cid': c, 'ts': 0, 'label': 'seq'} for c in content_ids[:-pos_n]]
+        pos_part = [{'cid': c, 'ts': 0, 'label': 'pos'} for c in content_ids[-pos_n:]]
+        return seq_part + pos_part
+
+    return None
+
+
 def process_action(line):
 
     if line is None:
@@ -652,6 +700,12 @@ class REDRecPrecomputedEmbeddingDataset(torch.utils.data.IterableDataset):
         self.loop_forever = config.data.get('precomputed_loop_forever', True)
         self.max_lines = config.data.get('precomputed_max_lines', None)
         self.stats_interval = config.data.get('precomputed_stats_interval', 10000)
+        # How many trailing items in a 64-d (array-form) record to mark as
+        # 'pos' targets vs 'seq' history. Ignored when the input jsonl uses
+        # the flat (datav1) schema with per-item labels. Defaults to 10 to
+        # match the upstream split convention; see normalize_history_record
+        # at the top of this module for the full schema-detection rule.
+        self.pos_n_for_64d = int(config.data.get('precomputed_64d_pos_n', 10))
 
         if self.embedding_dir is not None:
             # ---- memmap mode (shuffle-data format) ----
@@ -845,7 +899,11 @@ class REDRecPrecomputedEmbeddingDataset(torch.utils.data.IterableDataset):
 
                     try:
                         record = json.loads(line)
-                        input_cids, target_cids = self._select_training_window(record.get('history', []))
+                        history = normalize_history_record(record, pos_n=self.pos_n_for_64d)
+                        if history is None:
+                            skipped += 1
+                            continue
+                        input_cids, target_cids = self._select_training_window(history)
                         if input_cids is None or target_cids is None:
                             skipped += 1
                             continue
