@@ -490,10 +490,28 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
 # ---------------------------------------------------------------------------
 
 def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
-    """Build the rank-0 eval pack: dict with seq_emb / mask / target_idx / item_pool.
+    """Build a PER-USER eval pack against the full item pool.
 
-    Stride-samples ``eval_users`` users from ``v0_eval_jsonl``; for each user
-    emits ``eval_target_strategy`` ('all' / 'last' / 'first') target samples.
+    Layout (one row == one user, NOT one (user, pos) sample):
+        seq_cid_idx   : (U, L) int64 cpu  -- row index of each input cid into
+                                             ``embeddings_ref``, -1 for padding.
+        mask          : (U, L) uint8 cpu  -- 1 valid / 0 pad (left-padded).
+        hist_lens     : (U,)   int64 cpu  -- #valid input items per user.
+        pos_idx_lists : list[list[int]] (length U) -- deduped ground-truth
+                                                       item rows per user.
+        embeddings_ref / embed_dim / num_items -- pool meta.
+
+    Per-user metric definition (what evaluate_v0_recall consumes):
+        recall@K_u   = |TopK_u ∩ G_u| / |G_u|
+        hit_rate@K_u = 1{TopK_u ∩ G_u != empty}
+        final value  = mean over valid users.
+
+    Backward-compatibility note on ``eval_target_strategy``:
+        The old per-sample pack expanded each user's pos list according to
+        this flag ('all' / 'last' / 'first'). In the per-user formulation
+        the ground truth is intrinsically a SET, so the flag no longer has
+        a meaningful effect. We keep the yaml key so existing configs still
+        load; values other than 'all' just print a deprecation note.
     """
     if logger is None:
         logger = getLogger()
@@ -512,6 +530,12 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
     strat = str(d.get('eval_target_strategy', 'all')).lower()
     if strat not in ('all', 'last', 'first'):
         raise ValueError(f"eval_target_strategy must be one of all/last/first, got {strat!r}")
+    if strat != 'all':
+        logger.warning(
+            f"[v0_eval] eval_target_strategy={strat!r} is ignored under "
+            f"the per-user evaluation protocol; the entire pos set is used "
+            f"as ground truth for every user."
+        )
 
     use_full_file = eval_users <= 0
     if not use_full_file:
@@ -537,13 +561,21 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
     #                                  actual (L, D) fp32 sequence is deferred to
     #                                  the eval loop (per-batch GPU lookup).
     #   mask        : (U, L) uint8  -- 1 for real positions, 0 for padding.
-    #   target_idx  : (U,)   int64  -- row index of the target cid in `embeddings`.
+    #   hist_lens   : (U,)   int64  -- #valid items in the (untruncated) history,
+    #                                  used by evaluate_v0_recall to bucketize
+    #                                  per-user metrics by sequence length.
+    #   pos_idx_lists : list[list[int]] (length U) -- ground-truth item rows
+    #                                                 (deduplicated). Variable
+    #                                                 length, so kept as a
+    #                                                 python-list-of-lists; the
+    #                                                 per-rank shard is small
+    #                                                 (~6e4 users * ~10 pos)
+    #                                                 so this is fine.
     #
-    # For 612309 samples * 200 seq_len -> seq_cid_idx ~ 0.98 GB / rank,
-    # mask ~ 0.12 GB / rank. item_pool is NOT materialized as a separate tensor;
-    # we return the raw `embeddings` reference and let evaluate_v0_recall
-    # L2-normalize it on the GPU in chunks (one-time cost per eval).
-    seq_cid_idxs, masks, target_idxs = [], [], []
+    # For 50000 users * 200 seq_len -> seq_cid_idx ~ 80 MB, mask ~ 10 MB.
+    # item_pool is NOT materialized here; we pass `embeddings` through and let
+    # evaluate_v0_recall L2-normalize it on the GPU once per eval.
+    seq_cid_idxs, masks, hist_lens_list, pos_idx_lists = [], [], [], []
     L = max_seq_len
     skipped = 0
     n_users_read = 0
@@ -579,6 +611,10 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
                 if len(seq_cids) < min_history_len or not pos_cids:
                     skipped += 1
                     continue
+                # Track raw (pre-truncation) history length for length-bucket stats;
+                # the bucketization should reflect "user activity", not the model's
+                # context window.
+                full_hist_len = len(seq_cids)
                 if len(seq_cids) > L:
                     seq_cids = seq_cids[-L:]
 
@@ -589,42 +625,48 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
                     seq_idx[start + i] = int(cid_index[c])
                     mask[start + i] = 1
 
-                if strat == 'all':
-                    chosen = pos_cids
-                elif strat == 'last':
-                    chosen = [pos_cids[-1]]
-                else:
-                    chosen = [pos_cids[0]]
+                # Deduplicate positives to a SET (preserve first-seen order).
+                pos_idx_set = []
+                seen = set()
+                for c in pos_cids:
+                    idx = int(cid_index[c])
+                    if idx not in seen:
+                        seen.add(idx)
+                        pos_idx_set.append(idx)
+                if not pos_idx_set:
+                    skipped += 1
+                    continue
 
-                for tgt in chosen:
-                    # Share the same per-user idx/mask row across all of that
-                    # user's pos targets (just append references; np.stack
-                    # below will broadcast-copy them into the final tensor).
-                    seq_cid_idxs.append(seq_idx)
-                    masks.append(mask)
-                    target_idxs.append(int(cid_index[tgt]))
+                seq_cid_idxs.append(seq_idx)
+                masks.append(mask)
+                hist_lens_list.append(int(full_hist_len))
+                pos_idx_lists.append(pos_idx_set)
                 n_users_kept += 1
             except Exception:
                 skipped += 1
                 continue
 
+    avg_pos = (sum(len(p) for p in pos_idx_lists) / max(1, len(pos_idx_lists)))
+    avg_hist = (sum(hist_lens_list) / max(1, len(hist_lens_list)))
     logger.info(
         f'[v0_eval] users_read={n_users_read} users_kept={n_users_kept} '
-        f'skipped={skipped} samples={len(seq_cid_idxs)} (strat={strat}, max_seq_len={L})'
+        f'skipped={skipped} avg_hist_len={avg_hist:.1f} '
+        f'avg_pos_per_user={avg_pos:.2f} (max_seq_len={L})'
     )
     if not seq_cid_idxs:
         return None
 
     seq_cid_idx_t = torch.from_numpy(np.stack(seq_cid_idxs, axis=0))   # (U, L) int64
     mask_t = torch.from_numpy(np.stack(masks, axis=0))                  # (U, L) uint8
-    target_idx_t = torch.from_numpy(np.asarray(target_idxs, dtype=np.int64))
+    hist_lens_t = torch.tensor(hist_lens_list, dtype=torch.int64)       # (U,)
 
     n_seq_bytes = seq_cid_idx_t.numel() * seq_cid_idx_t.element_size()
     n_mask_bytes = mask_t.numel() * mask_t.element_size()
     logger.info(
         f'[v0_eval] eval pack indices built: seq_cid_idx={tuple(seq_cid_idx_t.shape)} '
         f'(~{n_seq_bytes / 1024 / 1024 / 1024:.2f} GB) '
-        f'mask={tuple(mask_t.shape)} (~{n_mask_bytes / 1024 / 1024:.0f} MB)'
+        f'mask={tuple(mask_t.shape)} (~{n_mask_bytes / 1024 / 1024:.0f} MB) '
+        f'pos_idx_lists=list[len={len(pos_idx_lists)}]'
     )
 
     # Item pool: keep as a reference, NOT a materialized fp32 tensor.
@@ -634,7 +676,8 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
     return {
         'seq_cid_idx': seq_cid_idx_t,
         'mask': mask_t,
-        'target_idx': target_idx_t,
+        'hist_lens': hist_lens_t,
+        'pos_idx_lists': pos_idx_lists,
         'embeddings_ref': embeddings,  # the same _MemmapEmbeddings used by training
         'embed_dim': int(embeddings.shape[1]),
         'num_items': int(embeddings.shape[0]),

@@ -394,16 +394,18 @@ class Trainer(object):
         self._v0_eval_pack = pack
         if self.rank == 0:
             # New eval-pack schema (v0_aligned_dataset.build_v0_eval_pack):
-            #   seq_cid_idx (U, L) int64 cpu  -- per-user per-step row index
-            #                                    into `embeddings_ref` (memmap).
-            #   mask        (U, L) uint8 cpu
-            #   target_idx  (U,)   int64 cpu
+            #   seq_cid_idx (U, L) int64 cpu  -- per-user row index into
+            #                                    `embeddings_ref` (memmap).
+            #   mask        (U, L) uint8 cpu  -- left-padded validity mask.
+            #   hist_lens   (U,)   int64 cpu  -- raw history length per user
+            #                                    (for bucketed reporting).
+            #   pos_idx_lists list[list[int]] -- ground-truth pos sets.
             #   embeddings_ref                -- shared memmap, NOT a copy.
             #   embed_dim, num_items          -- meta.
             # We don't materialize a fp32 (N, D) item_pool any more; that
             # tensor lives only on the GPU during evaluate_v0_recall.
             self.logger.info(
-                f'[v0_eval] eval pack ready: samples={pack["seq_cid_idx"].size(0)} '
+                f'[v0_eval] eval pack ready: users={pack["seq_cid_idx"].size(0)} '
                 f'item_pool=({pack["num_items"]}, {pack["embed_dim"]}) '
                 f'(memmap-backed, materialized on GPU per eval)'
             )
@@ -479,10 +481,29 @@ class Trainer(object):
         top500 = float(results.get('redrec', {}).get('top500_recall', 0.0)) if self.rank == 0 else None
 
         if self.rank == 0:
+            # Write per-user recall + hit_rate to tensorboard. Bucketed
+            # numbers are only printed in the formatted table (logger.info)
+            # to avoid cluttering tensorboard with ~6 buckets * 5 strategies
+            # * 2 metrics * |ks| curves; tail behavior should be inspected
+            # in the log.
+            #
+            # NOTE on the historical 'eval_recall/{name}_top{k}' field: the
+            # numerical SEMANTICS changed at this commit (sample-level hit
+            # rate -> per-user recall@K). We deliberately keep the same
+            # tensorboard tag so the curve is still navigable across older
+            # runs, but expect a discontinuity at the cutover step. Use the
+            # newly-added 'eval_hit_rate/...' tag for cross-cutover hit_rate
+            # comparisons (the new pack also writes per-user hit_rate which
+            # is closer in meaning to the old sample-level metric).
             for name, m in results.items():
                 for k in ks:
                     self.tensorboad_writer.add_scalar(
-                        f'eval_recall/{name}_top{k}', m[f'top{k}_recall'], self.cur_step
+                        f'eval_recall/{name}_top{k}',
+                        m[f'top{k}_recall'], self.cur_step,
+                    )
+                    self.tensorboad_writer.add_scalar(
+                        f'eval_hit_rate/{name}_top{k}',
+                        m[f'top{k}_hit_rate'], self.cur_step,
                     )
             self.logger.info(
                 f'[v0_eval] step={self.cur_step}\n' + format_recall_table(results, ks=ks)
@@ -582,6 +603,21 @@ class Trainer(object):
 
         if self.config.get('auto_resume', False):
             raise NotImplementedError
+
+        # ---- step-0 baseline eval ----
+        # Run one full eval BEFORE the training loop so that:
+        #   1) tensorboard / log carry a step=0 data point for the random-init
+        #      redrec embedding (lets us see the lift over training, not just
+        #      the trajectory after the first eval_interval steps);
+        #   2) the four zero-parameter baselines (mean_pool / last_pool /
+        #      last8_pool / last32_pool) populate `_v0_baseline_cache` early,
+        #      so the in-loop evals can skip recomputing them (~5x speedup
+        #      for the first in-loop eval).
+        # We rely on `self.cur_step == 0` here, which is the value set in
+        # __init__ before the training loop ever increments it.
+        if self._v0_eval_enabled:
+            self.logger.info('[v0_eval] running step-0 baseline eval before training ...')
+            self._run_v0_eval()
 
         self._train_epoch(train_data, show_progress=show_progress)
             

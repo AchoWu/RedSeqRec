@@ -1,38 +1,77 @@
-"""V0-aligned online eval helpers.
+"""V0-aligned online eval helpers (per-user formulation).
 
-Computes top-{1,10,50,100,500} recall over the full item pool for three
-user-embedding strategies:
+For each user U_i we compute ONE user embedding (via any of the
+strategies below), retrieve the top-K items from the FULL item pool,
+then compare against the user's ground-truth pos SET G_i:
 
-  * ``mean_pool`` : zero-parameter mean over valid input positions.
-  * ``last_pool`` : zero-parameter last valid position.
-  * ``redrec``    : the REDRec user tower (input_embedding_projector ->
-                    user_llm -> note_embedding_head, with N learnable
-                    queries appended). Runs the same forward path that
-                    ``model.forward_precomputed_embedding`` uses, but
-                    returns only the user embedding without the NCE loss.
+    recall@K_u   = |TopK_u  intersect G_u| / |G_u|
+    hit_rate@K_u = 1{TopK_u intersect G_u != empty}
 
-All three strategies score against the SAME L2-normalized item pool, so
-the recall numbers are directly comparable. The redrec strategy is used
-to track training progress; mean_pool / last_pool are zero-cost baselines
-that do not change over training (we evaluate them once and cache).
+The reported metric for each strategy / k is the simple mean over all
+valid users (and additionally per history-length bucket).
+
+Strategies:
+  * ``mean_pool``   : zero-parameter mean over valid input positions.
+  * ``last_pool``   : zero-parameter last valid position.
+  * ``last8_pool``  : mean over the last 8 valid positions.
+  * ``last32_pool`` : mean over the last 32 valid positions.
+  * ``redrec``      : the REDRec user tower (input_embedding_projector ->
+                      user_llm -> note_embedding_head, with N learnable
+                      queries appended). Same forward path that
+                      ``model.forward_precomputed_embedding`` uses, sans
+                      the NCE loss.
+
+All five strategies score against the SAME L2-normalized item pool so
+the recall / hit_rate numbers are directly comparable. mean / last /
+last8 / last32 are zero-cost baselines that do not change over training
+(we evaluate them once and cache).
 
 Distributed strategy
 --------------------
-Eval samples are sharded round-robin across ranks; each rank computes
-its local user embeddings + topk hits, then a single ``all_reduce(SUM)``
-combines counts. The item_pool is held on rank-0 only at build time,
-then broadcast to all ranks (or alternatively each rank keeps a copy
-loaded from the same memmap file -- both work; we go with the simpler
-"each rank loads its own pool" path since the memmap is page-cached).
+Eval users are sharded round-robin across ranks. Each rank computes
+its local user embeddings + per-user recall / hit_rate sums, then a
+single ``all_reduce(SUM)`` combines across ranks. Final reported value
+= sum(per_user_metric) / sum(valid_users).
 """
 
 from logging import getLogger
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+
+# History-length buckets for per-user metric breakdown. Each tuple is
+# [lo, hi) where hi=None means open-ended on the right. Ranges chosen
+# to match the v0 reference protocol (powers of two, 4 -> 8 -> ... -> 128+).
+HIST_LEN_BUCKETS: Tuple[Tuple[int, Optional[int], str], ...] = (
+    (4, 8, '4-7'),
+    (8, 16, '8-15'),
+    (16, 32, '16-31'),
+    (32, 64, '32-63'),
+    (64, 128, '64-127'),
+    (128, None, '128+'),
+)
+
+
+def _bucketize_hist_lens(hist_lens: torch.Tensor) -> torch.Tensor:
+    """Map (U,) int64 history lengths to (U,) int64 bucket id.
+
+    bucket id == len(HIST_LEN_BUCKETS) means "out of range" (e.g. < 4); such
+    users are excluded from per-bucket reporting (they shouldn't exist
+    because build_v0_eval_pack already enforces min_history_len, but we
+    handle it defensively).
+    """
+    out = torch.full_like(hist_lens, fill_value=len(HIST_LEN_BUCKETS))
+    for bid, (lo, hi, _) in enumerate(HIST_LEN_BUCKETS):
+        if hi is None:
+            sel = hist_lens >= lo
+        else:
+            sel = (hist_lens >= lo) & (hist_lens < hi)
+        out[sel] = bid
+    return out
 
 
 @torch.no_grad()
@@ -142,45 +181,112 @@ def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor) -> torch.
 
 
 @torch.no_grad()
-def _topk_hits_local(
+def _topk_metrics_local(
     user_emb: torch.Tensor,
-    target_idx: torch.Tensor,
+    pos_sets_padded: torch.Tensor,
+    pos_sets_lens: torch.Tensor,
     item_pool_T: torch.Tensor,
-    ks=(1, 10, 50, 100, 500),
+    bucket_ids: torch.Tensor,
+    n_buckets: int,
+    ks: Sequence[int] = (1, 10, 50, 100, 500),
     score_chunk: int = 1024,
     valid_mask: Optional[torch.Tensor] = None,
-) -> Dict[int, int]:
-    """For each user in this rank's shard, compute hit@k against the full item pool.
-
-    Returns a dict ``{k: total_hits_int}`` (NOT divided by U).
+) -> Dict[str, torch.Tensor]:
+    """Per-user top-k recall + hit_rate against the full item pool.
 
     Args:
-        user_emb:    (U, D)  user embeddings (cosine-normalize before topk).
-        target_idx:  (U,)    int64 row index in the item pool.
-        item_pool_T: (D, N)  L2-normalized item pool, transposed for matmul.
-        valid_mask:  (U,)    bool, True for real users / False for padding
-                             slots (padded so that DeepSpeed Stage3 sees
-                             equal forward count across ranks). Padding hits
-                             are excluded from the per-k count.
+        user_emb        : (U, D)         user embeddings (unnormalized OK,
+                                         normalized internally).
+        pos_sets_padded : (U, P_max)     int64 ground-truth item rows,
+                                         padded with -1 to a common width.
+        pos_sets_lens   : (U,)           int64 number of real pos per user
+                                         (>= 1 for valid users).
+        item_pool_T     : (D, N)         L2-normalized item pool.
+        bucket_ids      : (U,)           int64 history-length bucket id;
+                                         n_buckets == "out of range".
+        n_buckets       : int            number of in-range buckets.
+        valid_mask      : (U,)           bool, False for padding rows
+                                         appended to keep ranks lock-step.
+
+    Returns dict with float64 sum-tensors on `user_emb.device`:
+        recall_sum_overall   : (len(ks),)
+        hitrate_sum_overall  : (len(ks),)
+        valid_count_overall  : scalar (== valid users contributing).
+        recall_sum_bucket    : (n_buckets, len(ks))
+        hitrate_sum_bucket   : (n_buckets, len(ks))
+        valid_count_bucket   : (n_buckets,)
+    All sums are NOT divided by valid count; reduction (across ranks) +
+    final division happens in evaluate_v0_recall.
     """
+    device = user_emb.device
+    nks = len(ks)
+    out = {
+        'recall_sum_overall':  torch.zeros(nks, dtype=torch.float64, device=device),
+        'hitrate_sum_overall': torch.zeros(nks, dtype=torch.float64, device=device),
+        'valid_count_overall': torch.zeros((), dtype=torch.float64, device=device),
+        'recall_sum_bucket':   torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'hitrate_sum_bucket':  torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'valid_count_bucket':  torch.zeros(n_buckets, dtype=torch.float64, device=device),
+    }
     if user_emb.numel() == 0:
-        return {k: 0 for k in ks}
+        return out
+
     user_emb = F.normalize(user_emb.float(), dim=-1)
     max_k = max(ks)
-    hits = {k: 0 for k in ks}
     U = user_emb.size(0)
+
     for s in range(0, U, score_chunk):
         e = min(U, s + score_chunk)
-        u = user_emb[s:e]
-        t = target_idx[s:e]
-        scores = u @ item_pool_T  # (b, N)
-        topk = scores.topk(max_k, dim=1).indices  # (b, max_k)
-        for k in ks:
-            hit = (topk[:, :k] == t.unsqueeze(1)).any(dim=1)
-            if valid_mask is not None:
-                hit = hit & valid_mask[s:e]
-            hits[k] += int(hit.sum().item())
-    return hits
+        u = user_emb[s:e]                              # (b, D)
+        scores = u @ item_pool_T                       # (b, N)
+        topk = scores.topk(max_k, dim=1).indices       # (b, max_k) int64
+
+        pos_b = pos_sets_padded[s:e]                   # (b, P_max) int64 (-1 padded)
+        pos_len_b = pos_sets_lens[s:e].to(torch.float64)  # (b,)
+        bid_b = bucket_ids[s:e]                        # (b,)
+        if valid_mask is not None:
+            vm_b = valid_mask[s:e]
+        else:
+            vm_b = torch.ones(e - s, dtype=torch.bool, device=device)
+        # Force non-valid rows to NOT contribute regardless of length.
+        vm_b = vm_b & (pos_len_b > 0)
+
+        # match: (b, max_k, P_max) bool. Padded entries (-1) won't match any
+        # topk index because topk indices are in [0, N).
+        match = topk.unsqueeze(-1).eq(pos_b.unsqueeze(1))      # (b, max_k, P_max)
+
+        for ki, k in enumerate(ks):
+            top_k = match[:, :k, :]                            # (b, k, P_max)
+            # per-user, per-pos: did pos j land in top-k?
+            hit_per_pos = top_k.any(dim=1)                     # (b, P_max) bool
+            # recall_u = (#matched pos) / |G_u|
+            n_hit = hit_per_pos.to(torch.float64).sum(dim=1)   # (b,)
+            recall_u = n_hit / pos_len_b.clamp_min(1.0)        # (b,)
+            hit_u = (n_hit > 0).to(torch.float64)              # (b,)
+
+            # mask out padding/invalid users.
+            valid_f = vm_b.to(torch.float64)
+            recall_u = recall_u * valid_f
+            hit_u = hit_u * valid_f
+
+            out['recall_sum_overall'][ki] += recall_u.sum()
+            out['hitrate_sum_overall'][ki] += hit_u.sum()
+
+            # bucketize: scatter-add into (n_buckets,)
+            for bid in range(n_buckets):
+                sel = (bid_b == bid) & vm_b
+                if sel.any():
+                    out['recall_sum_bucket'][bid, ki] += recall_u[sel].sum()
+                    out['hitrate_sum_bucket'][bid, ki] += hit_u[sel].sum()
+
+        # valid_count counted ONCE per chunk (not per k).
+        out['valid_count_overall'] += vm_b.to(torch.float64).sum()
+        for bid in range(n_buckets):
+            sel = (bid_b == bid) & vm_b
+            if sel.any():
+                out['valid_count_bucket'][bid] += sel.to(torch.float64).sum()
+
+    return out
 
 
 @torch.no_grad()
@@ -195,36 +301,68 @@ def evaluate_v0_recall(
     ks=(1, 10, 50, 100, 500),
     eval_baselines: bool = True,
 ) -> Dict[str, Dict[str, float]]:
-    """Evaluate redrec (and optionally mean_pool / last_pool) recall on a hold-out set.
+    """Evaluate per-user recall@K and hit_rate@K against the full item pool.
+
+    For each strategy ('redrec', 'mean_pool', 'last_pool', 'last8_pool',
+    'last32_pool') we encode each user ONCE, retrieve the top-max(ks) items,
+    and report:
+        recall@K_u   = |TopK_u  intersect G_u| / |G_u|
+        hit_rate@K_u = 1{TopK_u intersect G_u != empty}
+    averaged over valid users (and additionally per history-length bucket).
 
     ``eval_pack`` (built by ``build_v0_eval_pack`` on each rank):
         seq_cid_idx    : (U, L) int64 cpu  -- row index into embeddings_ref,
                                               -1 for padding slots.
-        mask           : (U, L) uint8 cpu  -- 1 valid / 0 pad.
-        target_idx     : (U,)   int64 cpu  -- row index of the pos target.
-        embeddings_ref : ndarray-like      -- shared memmap (NOT a copy);
-                                              evaluate_v0_recall slices and
-                                              uploads only the rows it needs
-                                              for each user batch.
+        mask           : (U, L) uint8 cpu  -- 1 valid / 0 pad (left-padded).
+        hist_lens      : (U,)   int64 cpu  -- raw (pre-truncation) history
+                                              length per user, used for
+                                              bucketed reporting.
+        pos_idx_lists  : list[list[int]] (length U) -- ground-truth item rows.
+        embeddings_ref : ndarray-like      -- shared memmap (NOT a copy).
         embed_dim      : int
         num_items      : int
 
-    Each rank processes ``[rank::world_size]`` slice of users; hit counts
-    are all-reduced (SUM) across ranks. Final recall = total_hits / U.
+    Each rank processes ``[rank::world_size]`` slice of users; per-user
+    metric SUMS are all-reduced (SUM) across ranks. Final value =
+    sum(per_user_metric) / sum(valid_users).
 
     Returns:
-        {strategy_name: {f'top{k}_recall': float, ...}, ...}
+        {strategy_name: {
+            'top{k}_recall'    : float,
+            'top{k}_hit_rate'  : float,
+            'top{k}_recall_bucket'   : { bucket_label: float, ... },
+            'top{k}_hit_rate_bucket' : { bucket_label: float, ... },
+            ...
+            '_n_users_overall' : int,
+            '_n_users_bucket'  : { bucket_label: int, ... },
+        }}
     """
     logger = getLogger()
     seq_cid_idx_full = eval_pack['seq_cid_idx']        # (U, L) int64 cpu
     mask_full = eval_pack['mask']                      # (U, L) uint8 cpu
-    target_idx_full = eval_pack['target_idx']          # (U,)   int64 cpu
+    hist_lens_full = eval_pack['hist_lens']            # (U,)   int64 cpu
+    pos_idx_lists = eval_pack['pos_idx_lists']         # list[list[int]] len U
     embeddings = eval_pack['embeddings_ref']           # memmap or ndarray
     embed_dim = int(eval_pack['embed_dim'])
     num_items = int(eval_pack['num_items'])
 
     U_total = seq_cid_idx_full.size(0)
     L = int(seq_cid_idx_full.size(1))
+
+    # ---- pad pos_idx_lists to a (U, P_max) int64 tensor ----
+    # Padding sentinel is -1, which can never collide with a valid item row.
+    # P_max here is the global max (across all users in the pack); for the
+    # 64-d run with pos_n_for_64d=10 + dedup it's typically <= 10, well
+    # within memory. If a future run blows this up (>1000) we'd want to
+    # switch to per-batch padding instead.
+    pos_lens_np = np.asarray([len(p) for p in pos_idx_lists], dtype=np.int64)
+    P_max = int(pos_lens_np.max()) if len(pos_lens_np) > 0 else 0
+    pos_padded_np = np.full((U_total, max(1, P_max)), fill_value=-1, dtype=np.int64)
+    for i, lst in enumerate(pos_idx_lists):
+        if lst:
+            pos_padded_np[i, :len(lst)] = np.asarray(lst, dtype=np.int64)
+    pos_padded_full = torch.from_numpy(pos_padded_np)  # (U, P_max) int64 cpu
+    pos_lens_full = torch.from_numpy(pos_lens_np)      # (U,)       int64 cpu
 
     # ---- shard users round-robin across ranks, PADDED to equal length ----
     # Padding rationale: every rank must call _redrec_user_emb the same number
@@ -247,10 +385,6 @@ def evaluate_v0_recall(
         valid_mask_local = torch.ones(idx_local.numel(), dtype=torch.bool)
 
     # ---- materialize item_pool on GPU and L2-normalize there ----
-    # This is the ONLY full (N, D) tensor we put on the GPU. For Qwen2.5-1.5B
-    # + Stage1 we have ~50-60 GB free per H20, plenty for a 6.67 GB fp32
-    # item pool. We chunk the upload so the host-side fp32 staging buffer
-    # also stays bounded.
     if rank == 0:
         logger.info(
             f'[v0_eval] uploading item_pool ({num_items} x {embed_dim}) to GPU '
@@ -270,36 +404,76 @@ def evaluate_v0_recall(
         del block, block_t
     item_pool_T = item_pool_d.t().contiguous()         # (D, N)
 
-    target_idx_local = target_idx_full[idx_local].to(device)
+    # Per-batch-of-users scoped state on device.
+    pos_padded_local = pos_padded_full[idx_local].to(device)   # (U_local, P_max)
+    pos_lens_local = pos_lens_full[idx_local].to(device)       # (U_local,)
+    hist_lens_local = hist_lens_full[idx_local].to(device)     # (U_local,)
+    bucket_ids_local = _bucketize_hist_lens(hist_lens_local).to(device)
     valid_mask_local_d = valid_mask_local.to(device)
+    n_buckets = len(HIST_LEN_BUCKETS)
+    bucket_labels = [b[2] for b in HIST_LEN_BUCKETS]
 
     results: Dict[str, Dict[str, float]] = {}
 
-    def _reduce_hits_to_recall(hits_local: Dict[int, int]) -> Dict[str, float]:
-        if world_size > 1:
-            buf = torch.tensor(
-                [hits_local[k] for k in ks], dtype=torch.long, device=device
-            )
-            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-            totals = buf.tolist()
-        else:
-            totals = [hits_local[k] for k in ks]
-        return {f'top{k}_recall': totals[i] / max(1, U_total)
-                for i, k in enumerate(ks)}
+    def _reduce_to_metrics(local_acc: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """SUM-reduce sums across ranks and divide by valid counts.
 
-    # ---- helper: load a batch of (seq_emb, mask) onto the GPU ----
-    # We use item_pool_d (already on GPU, but normalized) ONLY for normalized
-    # negatives -- for the input sequence we need the *un*-normalized
-    # embeddings, because the redrec input projector was trained on raw
-    # embeddings. So we keep a parallel raw item_pool on GPU as well IF the
-    # user ever asks for the redrec strategy. For mean/last pool, normalized
-    # is fine because we re-normalize the user emb downstream anyway.
-    # For simplicity and correctness we materialize a raw (un-normalized)
-    # item_pool on GPU as well. Total GPU pool memory: 2 * 6.67 GB = 13.3 GB
-    # (still well within budget). NOTE: we could index `embeddings` per batch
-    # from CPU to save GPU memory, but uploading 768 (bs) * 200 (L) = 153K
-    # rows per batch = 0.3 GB transfer per batch is comparable to a single
-    # one-time upload, and the CPU memmap path is slower due to PCIe round-trips.
+        Returns a flat dict with:
+            top{k}_recall, top{k}_hit_rate            : overall floats
+            top{k}_recall_bucket, top{k}_hit_rate_bucket : bucket -> float
+            _n_users_overall                          : int
+            _n_users_bucket                           : bucket -> int
+        """
+        # Pack everything into a single tensor for one all_reduce.
+        nks = len(ks)
+        if world_size > 1:
+            buf = torch.cat([
+                local_acc['recall_sum_overall'].reshape(-1),         # nks
+                local_acc['hitrate_sum_overall'].reshape(-1),        # nks
+                local_acc['valid_count_overall'].reshape(1),         # 1
+                local_acc['recall_sum_bucket'].reshape(-1),          # n_buckets * nks
+                local_acc['hitrate_sum_bucket'].reshape(-1),         # n_buckets * nks
+                local_acc['valid_count_bucket'].reshape(-1),         # n_buckets
+            ]).to(torch.float64)
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            offset = 0
+            recall_overall = buf[offset:offset + nks].cpu().tolist(); offset += nks
+            hitrate_overall = buf[offset:offset + nks].cpu().tolist(); offset += nks
+            n_overall = float(buf[offset].item()); offset += 1
+            recall_bucket = buf[offset:offset + n_buckets * nks].reshape(
+                n_buckets, nks).cpu().tolist(); offset += n_buckets * nks
+            hitrate_bucket = buf[offset:offset + n_buckets * nks].reshape(
+                n_buckets, nks).cpu().tolist(); offset += n_buckets * nks
+            n_bucket = buf[offset:offset + n_buckets].cpu().tolist()
+        else:
+            recall_overall = local_acc['recall_sum_overall'].cpu().tolist()
+            hitrate_overall = local_acc['hitrate_sum_overall'].cpu().tolist()
+            n_overall = float(local_acc['valid_count_overall'].item())
+            recall_bucket = local_acc['recall_sum_bucket'].cpu().tolist()
+            hitrate_bucket = local_acc['hitrate_sum_bucket'].cpu().tolist()
+            n_bucket = local_acc['valid_count_bucket'].cpu().tolist()
+
+        out: Dict[str, float] = {}
+        denom_overall = max(1.0, n_overall)
+        for ki, k in enumerate(ks):
+            out[f'top{k}_recall'] = recall_overall[ki] / denom_overall
+            out[f'top{k}_hit_rate'] = hitrate_overall[ki] / denom_overall
+        for ki, k in enumerate(ks):
+            r_b = {}
+            h_b = {}
+            for bid, lab in enumerate(bucket_labels):
+                d = max(1.0, n_bucket[bid])
+                r_b[lab] = recall_bucket[bid][ki] / d
+                h_b[lab] = hitrate_bucket[bid][ki] / d
+            out[f'top{k}_recall_bucket'] = r_b
+            out[f'top{k}_hit_rate_bucket'] = h_b
+        out['_n_users_overall'] = int(round(n_overall))
+        out['_n_users_bucket'] = {
+            lab: int(round(n_bucket[bid])) for bid, lab in enumerate(bucket_labels)
+        }
+        return out
+
+    # ---- raw item_pool (un-normalized) for input-side lookups ----
     if rank == 0:
         logger.info(
             f'[v0_eval] uploading raw item_pool ({num_items} x {embed_dim}) '
@@ -332,6 +506,21 @@ def evaluate_v0_recall(
         seq_b = seq_b * mask_b.unsqueeze(-1).to(seq_b.dtype)
         return seq_b, mask_b
 
+    def _empty_acc():
+        nks = len(ks)
+        return {
+            'recall_sum_overall':  torch.zeros(nks, dtype=torch.float64, device=device),
+            'hitrate_sum_overall': torch.zeros(nks, dtype=torch.float64, device=device),
+            'valid_count_overall': torch.zeros((), dtype=torch.float64, device=device),
+            'recall_sum_bucket':   torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+            'hitrate_sum_bucket':  torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+            'valid_count_bucket':  torch.zeros(n_buckets, dtype=torch.float64, device=device),
+        }
+
+    def _add_acc(dst, src):
+        for k_ in dst:
+            dst[k_] = dst[k_] + src[k_]
+
     # ---- redrec strategy ----
     model_was_training = False
     base = model
@@ -344,7 +533,7 @@ def evaluate_v0_recall(
         model_was_training = True
     model.eval()
 
-    redrec_hits = {k: 0 for k in ks}
+    redrec_acc = _empty_acc()
     n_local = idx_local.numel()
     if n_local > 0:
         for s in range(0, n_local, user_batch):
@@ -352,75 +541,69 @@ def evaluate_v0_recall(
             sl = idx_local[s:e]
             seq_b, mask_b = _gather_seq_batch(sl)
             ue = _redrec_user_emb(model, seq_b, mask_b)
-            t_b = target_idx_local[s:e]
+            pos_b = pos_padded_local[s:e]
+            plen_b = pos_lens_local[s:e]
+            bid_b = bucket_ids_local[s:e]
             vm_b = valid_mask_local_d[s:e]
-            h = _topk_hits_local(
-                ue, t_b, item_pool_T, ks=ks,
-                score_chunk=score_chunk, valid_mask=vm_b,
+            chunk_acc = _topk_metrics_local(
+                ue, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
             )
-            for k in ks:
-                redrec_hits[k] += h[k]
-    results['redrec'] = _reduce_hits_to_recall(redrec_hits)
+            _add_acc(redrec_acc, chunk_acc)
+    results['redrec'] = _reduce_to_metrics(redrec_acc)
 
     # ---- zero-param baselines ----
-    # Aligned with the v0 reference run (see
-    # /apdcephfs_gy4/share_303218624/jingweidong/output/logs/nohup_20260602_114853.log):
+    # Aligned with the v0 reference run:
     #   mean_pool   : mean over ALL valid positions
     #   last_pool   : the last valid position
     #   last8_pool  : mean over the last 8 valid positions
     #   last32_pool : mean over the last 32 valid positions
-    # All four are zero-parameter and target-time invariant, so we only need to
-    # evaluate them once (cached in trainer).
+    # All four are zero-parameter and target-time invariant, so we only need
+    # to evaluate them once (cached in trainer).
     if eval_baselines:
-        mean_hits = {k: 0 for k in ks}
-        last_hits = {k: 0 for k in ks}
-        last8_hits = {k: 0 for k in ks}
-        last32_hits = {k: 0 for k in ks}
+        mean_acc = _empty_acc()
+        last_acc = _empty_acc()
+        last8_acc = _empty_acc()
+        last32_acc = _empty_acc()
         if n_local > 0:
             for s in range(0, n_local, user_batch):
                 e = min(n_local, s + user_batch)
                 sl = idx_local[s:e]
                 seq_b, mask_b = _gather_seq_batch(sl)
-                t_b = target_idx_local[s:e]
+                pos_b = pos_padded_local[s:e]
+                plen_b = pos_lens_local[s:e]
+                bid_b = bucket_ids_local[s:e]
                 vm_b = valid_mask_local_d[s:e]
 
                 mp = _mean_pool(seq_b, mask_b)
-                h_m = _topk_hits_local(
-                    mp, t_b, item_pool_T, ks=ks,
-                    score_chunk=score_chunk, valid_mask=vm_b,
-                )
-                for k in ks:
-                    mean_hits[k] += h_m[k]
+                _add_acc(mean_acc, _topk_metrics_local(
+                    mp, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
 
                 lp = _last_pool(seq_b, mask_b)
-                h_l = _topk_hits_local(
-                    lp, t_b, item_pool_T, ks=ks,
-                    score_chunk=score_chunk, valid_mask=vm_b,
-                )
-                for k in ks:
-                    last_hits[k] += h_l[k]
+                _add_acc(last_acc, _topk_metrics_local(
+                    lp, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
 
                 lp8 = _last_n_pool(seq_b, mask_b, n=8)
-                h_l8 = _topk_hits_local(
-                    lp8, t_b, item_pool_T, ks=ks,
-                    score_chunk=score_chunk, valid_mask=vm_b,
-                )
-                for k in ks:
-                    last8_hits[k] += h_l8[k]
+                _add_acc(last8_acc, _topk_metrics_local(
+                    lp8, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
 
                 lp32 = _last_n_pool(seq_b, mask_b, n=32)
-                h_l32 = _topk_hits_local(
-                    lp32, t_b, item_pool_T, ks=ks,
-                    score_chunk=score_chunk, valid_mask=vm_b,
-                )
-                for k in ks:
-                    last32_hits[k] += h_l32[k]
-        results['mean_pool'] = _reduce_hits_to_recall(mean_hits)
-        results['last_pool'] = _reduce_hits_to_recall(last_hits)
-        results['last8_pool'] = _reduce_hits_to_recall(last8_hits)
-        results['last32_pool'] = _reduce_hits_to_recall(last32_hits)
+                _add_acc(last32_acc, _topk_metrics_local(
+                    lp32, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
+        results['mean_pool'] = _reduce_to_metrics(mean_acc)
+        results['last_pool'] = _reduce_to_metrics(last_acc)
+        results['last8_pool'] = _reduce_to_metrics(last8_acc)
+        results['last32_pool'] = _reduce_to_metrics(last32_acc)
 
-    # Free GPU buffers (~20 GB on H20 -> we don't want them lingering across
+    # Free GPU buffers (~13 GB on H20 -> we don't want them lingering across
     # 1000-step gaps; the next eval can rebuild from page-cached memmap fast).
     del item_pool_T, item_pool_d, item_pool_raw_d
     torch.cuda.empty_cache()
@@ -431,27 +614,79 @@ def evaluate_v0_recall(
     if rank == 0:
         ks_list = list(ks)
         for name, m in results.items():
-            metric_str = ' '.join(f'top{k}={m[f"top{k}_recall"]:.4f}' for k in ks_list)
-            logger.info(f'[v0_eval] {name:<10} | {metric_str}')
+            recall_str = ' '.join(f'r@{k}={m[f"top{k}_recall"]:.4f}' for k in ks_list)
+            hit_str = ' '.join(f'h@{k}={m[f"top{k}_hit_rate"]:.4f}' for k in ks_list)
+            n_users = m.get('_n_users_overall', 0)
+            logger.info(f'[v0_eval] {name:<11} | n={n_users} | {recall_str} | {hit_str}')
 
     return results
 
 
 def format_recall_table(results: Dict[str, Dict[str, float]],
                         ks=(1, 10, 50, 100, 500)) -> str:
-    """Pretty-print the comparison table (rank-0 only)."""
-    header_cols = [f'top{k}' for k in ks]
-    header = f"{'strategy':<12} | " + ' | '.join(f'{c:>10}' for c in header_cols)
-    lines = [header, '-' * len(header)]
-    for name, m in results.items():
-        cells = ' | '.join(f'{m[f"top{k}_recall"]:>10.4f}' for k in ks)
-        lines.append(f"{name:<12} | {cells}")
+    """Pretty-print the per-user comparison table (rank-0 only).
+
+    Layout:
+        1) overall recall@K table (one row per strategy)
+        2) overall hit_rate@K table (one row per strategy)
+        3) per-history-length-bucket recall@K table for the redrec strategy
+           and each baseline (mean_pool / last_pool / last8_pool / last32_pool)
+        4) lift line: redrec top-K recall vs the best pooling baseline
+    """
+    ks_list = list(ks)
+    header_cols = [f'top{k}' for k in ks_list]
+
+    def _table(metric_key_fn, title):
+        lines = [f'== {title} ==']
+        header = f"{'strategy':<12} | " + ' | '.join(f'{c:>10}' for c in header_cols)
+        lines.append(header)
+        lines.append('-' * len(header))
+        for name, m in results.items():
+            cells = ' | '.join(
+                f'{m.get(metric_key_fn(k), 0.0):>10.4f}' for k in ks_list
+            )
+            lines.append(f"{name:<12} | {cells}")
+        return lines
+
+    lines: List[str] = []
+    lines.extend(_table(lambda k: f'top{k}_recall', 'recall@K (per-user mean)'))
+    lines.append('')
+    lines.extend(_table(lambda k: f'top{k}_hit_rate', 'hit_rate@K (per-user mean)'))
+
+    # Per-bucket recall breakdown (only if at least one strategy carries it).
+    any_bucket_keys = False
+    for m in results.values():
+        if any(f'top{k}_recall_bucket' in m for k in ks_list):
+            any_bucket_keys = True
+            break
+    if any_bucket_keys:
+        # Pick the bucket label list from the first strategy that has them.
+        bucket_labels: List[str] = []
+        for m in results.values():
+            for k in ks_list:
+                rb = m.get(f'top{k}_recall_bucket')
+                if isinstance(rb, dict) and rb:
+                    bucket_labels = list(rb.keys())
+                    break
+            if bucket_labels:
+                break
+        for name, m in results.items():
+            n_bucket_dict = m.get('_n_users_bucket', {})
+            lines.append('')
+            lines.append(f'== {name} | recall@K by hist_len bucket ==')
+            header_b = f"{'bucket':<10} {'n_users':>9} | " + \
+                ' | '.join(f'{c:>10}' for c in header_cols)
+            lines.append(header_b)
+            lines.append('-' * len(header_b))
+            for lab in bucket_labels:
+                n_u = int(n_bucket_dict.get(lab, 0))
+                cells = []
+                for k in ks_list:
+                    rb = m.get(f'top{k}_recall_bucket', {})
+                    cells.append(f'{rb.get(lab, 0.0):>10.4f}')
+                lines.append(f"{lab:<10} {n_u:>9} | " + ' | '.join(cells))
+
     if 'redrec' in results:
-        # Pick a k for the "lift over best pooling baseline" line. Prefer 10 to
-        # match the historical default; if 10 isn't in `ks` (e.g. the trainer
-        # configured ks=(1,50,100,500) to align with the v0 reference run),
-        # fall back to the smallest k present so the table still prints.
-        ks_list = list(ks)
         lift_k = 10 if 10 in ks_list else (min(ks_list) if ks_list else None)
         if lift_k is not None:
             lift_key = f'top{lift_k}_recall'
@@ -466,7 +701,7 @@ def format_recall_table(results: Dict[str, Dict[str, float]],
                 if best > 0:
                     lines.append('')
                     lines.append(
-                        f'>>> redrec top{lift_k} lift over best pooling baseline: '
+                        f'>>> redrec top{lift_k} recall lift over best pooling baseline: '
                         f'{(v - best) / best * 100:+.2f}%'
                     )
     return '\n'.join(lines)
