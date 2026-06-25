@@ -118,7 +118,7 @@ training:
     # finished stage 1 with cosine-decayed LR near zero, so a 10x jump
     # would be ~100x effective amplification on weights that just
     # stabilized).
-    learning_rate: 1.0e-5
+    learning_rate: 2.0e-5
     weight_decay: 0.01
 
   scheduler_args:
