@@ -168,7 +168,7 @@ training:
   #     <ckpt_dir>/pytorch_model.bin
   # run.py auto-detects: file path -> torch.load, directory -> deepspeed
   # zero load.
-  load_pretrained_model: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/precomputed_shuffle_user_tower_v2_projwarmup_64d_20260625_105718/checkpoint-93001
+  load_pretrained_model: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/precomputed_shuffle_user_tower_v2_projwarmup_64d_20260625_105718/checkpoint-89001
 
 saver:
   v0_style: true
