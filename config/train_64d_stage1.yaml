@@ -1,0 +1,194 @@
+data:
+  # ===================================================================
+  # 64-d multi-interest training (stage 1: adapter warmup, user_llm frozen)
+  #
+  # Data protocol matches RedSeqRecV0Simple/config/v0_3emb_64d.yaml:
+  #   * train.jsonl: one user per line, history.label in {seq, pos}
+  #     OR plain content_ids (handled by normalize_history_record).
+  #   * For each user the LAST `target_tail_len`=10 positives are the
+  #     prediction target; the rest are the input sequence.
+  #   * 50000 users are stride-sampled from test.jsonl as the held-out
+  #     eval set (eval ground truth = same tail-10 set).
+  # Item embedding pool: 64-d memmap (preprocessed64d).
+  # ===================================================================
+  dataset_type: v0_aligned
+
+  # Train / eval jsonl (V0Simple shares these exact paths).
+  v0_train_jsonl: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/user_latest/train.jsonl
+  v0_eval_jsonl:  /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/user_latest/test.jsonl
+  # 64-d memmap embedding directory (cids.npy + embeddings.bin + meta.json).
+  v0_embedding_dir: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/preprocessed64d
+
+  # ---- per-user sample selection (V0Simple 64-d defaults) ----
+  seq_label: seq
+  positive_label: pos
+  hard_neg_label: []
+  max_hard_neg: 0
+  # min_history_len=20 mirrors RedSeqRecV0Simple/config/v0_3emb_64d.yaml.
+  # Users with fewer than 20 valid clicks (after cid filtering) are
+  # skipped, keeping a 10-pos margin so input_seq_len >= 10.
+  min_history_len: 20
+  max_seq_len: 200
+  sample_lastn: true
+  # train_target_strategy is unused when multi_interest is enabled, but we
+  # leave the legacy key present so the loader's enum check still passes.
+  train_target_strategy: random
+  loop_forever: true
+  shuffle_buffer_size: 1024
+
+  # ---- multi-interest target tail (the actual training target spec) ----
+  multi_interest:
+    enabled: true
+    target_tail_len: 10
+    # KMeans hyperparams below are accepted for forward-compat with the
+    # V0Simple yaml but not consumed: clustering happens GPU-side inside
+    # model.forward_precomputed_embedding via cluster_based_matching
+    # (cosine kmeans + linear_sum_assignment), which performs both
+    # init and N-iter refinement in a single call.
+    kmeans_k: 3
+    kmeans_n_iter: 5
+    kmeans_n_init: 1
+
+  # ---- hold-out eval (V0Simple per-user recall@K + hit_rate@K) ----
+  eval_users: 50000
+  eval_target_strategy: all
+  eval_seed: 42
+
+  # ---- batch / negatives ----
+  # Stage 1 freezes user_llm (no LLM grad/optim state). We can afford a
+  # larger per-rank micro-batch. But cuBLAS Lt SIGFPE bug also applies
+  # here: launcher overrides train_batch_size/accumulation_steps to
+  # bs=4*accum=8 (effective bs=32 per rank) when needed; default below
+  # is bs=8 to match V0Simple's effective bs/rank when LLM is frozen.
+  train_batch_size: 8
+  neg_samples_per_gpu: 400
+  neg_pool_size_per_gpu: 1000000
+
+  train_num_workers: 8
+  precomputed_stats_interval: 10000
+
+  # Required for normalize_history_record to recognize the array-form
+  # (datav2) schema where train.jsonl carries plain content_ids. Should
+  # equal multi_interest.target_tail_len so the eval-pack and the
+  # training pipeline agree on which items are positives.
+  precomputed_64d_pos_n: 10
+
+  # ---- legacy fields kept so existing code paths don't crash ----
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+
+model:
+  model_name: REDRec
+  # item_llm is NOT used in the precomputed-embedding path; we only
+  # construct user_llm. The item_pretrain_dir field is retained because
+  # _create_llm() is still called for `self.item_llm` (kept for legacy
+  # compat); item_llm_init=false avoids loading any weights into it.
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  # === 64-d topology ===
+  # Input adapter:  Linear(64 -> 1536) + GELU + LayerNorm(1536)
+  # Output adapter: ProjectionHead(1536 -> 64, residual + LN)
+  # output_mlp:     nn.Identity (user_output_dim == user_final_dim == 64)
+  precomputed_input_dim: 64
+  user_output_dim: 64
+  user_final_dim: 64
+  use_ft_flash_attn: true
+  use_lora: false
+  # Stage 1 freezes user_llm so grad ckpt is unnecessary.
+  gradient_checkpointing: false
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  # === V0Simple multi-interest config: 3 user queries, 10 targets ===
+  # window_pos must equal query_nums so the user-side anchor slots line
+  # up with the cluster-matched targets in forward_precomputed_embedding.
+  query_nums: 3
+  window_pos: 3
+
+# Stage 1: freeze entire user_llm trunk; train only adapter modules
+# (input_embedding_projector, note_embedding_head, query, logit_scale).
+freeze_prefix:
+  - 'user_llm'
+
+training:
+  target: homefeed
+  optim_args:
+    # Adapter-only training. 1e-3 matches the 512-d stage-1 setting; the
+    # adapter parameter count is similar (64->1536 vs 512->1536, both
+    # dominated by the 1536-side weight) so the same learning rate works.
+    learning_rate: 1.0e-3
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    warmup_steps: 2000
+
+  # Eval / log / save cadence (matches V0Simple cadence = 1000 steps).
+  eval_step: 1000
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+  save_step: 1000
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  total_step: 100000
+  strategy: deepspeed
+  # ZeRO Stage 2 is plenty when user_llm is frozen (no LLM grad / optim
+  # state; no need for per-layer param sharding). Keeps comm overhead low.
+  stage: 2
+  gradient_checkpointing: false
+  # Stage 1 starts cold (no pretrained user-tower ckpt). Stage 2 yaml
+  # fills this with the best-recall ckpt produced by this stage-1 run.
+  load_pretrained_model: ''
+
+saver:
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  v0_style: true
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  saved_model_name: redrec_64d_3query_stage1
+
+eval:
+  target: homefeed
+  model_path: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/redrec_64d_3query_stage1_<RUN_TS>/checkpoint-100001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 200
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 10
+reproducibility: false

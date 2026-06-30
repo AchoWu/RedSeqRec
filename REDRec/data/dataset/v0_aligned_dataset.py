@@ -248,12 +248,29 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         self.min_history_len = int(d.get('min_history_len', 4))
         self.sample_lastn = bool(d.get('sample_lastn', True))
         ts_str = str(d.get('train_target_strategy', 'random')).lower()
-        if ts_str not in ('random', 'last'):
-            raise ValueError(f"train_target_strategy must be 'random'|'last', got {ts_str!r}")
+        if ts_str not in ('random', 'last', 'multi'):
+            raise ValueError(f"train_target_strategy must be 'random'|'last'|'multi', got {ts_str!r}")
         self.target_strategy = ts_str
         self.loop_forever = bool(d.get('loop_forever', True))
         self.shuffle_buffer_size = max(0, int(d.get('shuffle_buffer_size', 1024)))
         self.max_lines = d.get('max_lines', None)
+
+        # ---- multi-interest mode (V0Simple 64-d experiment alignment) ----
+        # When enabled, the dataset emits all `target_tail_len` positives per
+        # user as a (B, T, D) target tensor instead of a single (B, 1, D)
+        # target. The model side (forward_precomputed_embedding) already
+        # supports N>=query_nums via cluster_based_matching: T=10 positives
+        # are kmeans-clustered to query_nums=3 centers, then 1-to-1 matched
+        # to the 3 user queries via Hungarian (linear_sum_assignment).
+        mi_cfg = d.get('multi_interest', None) or {}
+        self.multi_interest_enabled = bool(mi_cfg.get('enabled', False))
+        # If train_target_strategy='multi' is set, force-enable multi-interest
+        # for backward-compat with people who only flip the strategy flag.
+        if self.target_strategy == 'multi':
+            self.multi_interest_enabled = True
+        self.target_tail_len = int(mi_cfg.get('target_tail_len', 10))
+        if self.multi_interest_enabled and self.target_tail_len <= 0:
+            raise ValueError('multi_interest.target_tail_len must be > 0 when enabled.')
 
         # ---- training batch / negatives ----
         self.train_batch_size = int(d.get('train_batch_size', 8))
@@ -303,6 +320,13 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
 
     # ---- per-user sample selection (mirrors V0._select_window) ----
     def _select_window(self, history):
+        """Return (input_cids, target_cid_or_list, hard_neg_cids).
+
+        In single-target mode (default): target_cid_or_list is a `str`.
+        In multi-interest mode: target_cid_or_list is a `list[str]` of length
+          `target_tail_len`, taken from the LAST T positives of the user.
+        Returns (None, None, None) when the user fails the gating check.
+        """
         seq_items, pos_items, hard_neg_items = [], [], []
         for it in history:
             cid = it.get('cid')
@@ -328,17 +352,25 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         else:
             input_cids = list(seq_items)
 
-        if self.target_strategy == 'random':
-            target_cid = random.choice(pos_items)
+        if self.multi_interest_enabled:
+            T = self.target_tail_len
+            if len(pos_items) < T:
+                # Not enough positives to fill the (B, T, D) target tensor.
+                return None, None, None
+            target = pos_items[-T:]
         else:
-            target_cid = pos_items[-1]
+            if self.target_strategy == 'random':
+                target = random.choice(pos_items)
+            else:
+                target = pos_items[-1]
 
         hard_neg_cids = []
         if hard_neg_items and self.max_hard_neg > 0:
             seen = set()
             uniq = []
+            target_set = set(target) if isinstance(target, list) else {target}
             for c in hard_neg_items:
-                if c == target_cid or c in seen:
+                if c in target_set or c in seen:
                     continue
                 seen.add(c)
                 uniq.append(c)
@@ -346,29 +378,38 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
                 uniq = random.sample(uniq, self.max_hard_neg)
             hard_neg_cids = uniq
 
-        return input_cids, target_cid, hard_neg_cids
+        return input_cids, target, hard_neg_cids
 
     # ---- batch construction (REDRec dict schema) ----
     def _build_batch(self, samples):
         B = len(samples)
         L = self.max_seq_len
         D = self.embed_dim
+        # T=1 in single-target mode, T=target_tail_len in multi-interest mode.
+        T = self.target_tail_len if self.multi_interest_enabled else 1
 
         input_embeds = np.zeros((B, L, D), dtype=np.float32)
         attention_mask = np.zeros((B, L), dtype=np.int64)
-        target_embeds = np.zeros((B, 1, D), dtype=np.float32)
-        target_mask = np.ones((B, 1), dtype=np.int64)
+        target_embeds = np.zeros((B, T, D), dtype=np.float32)
+        target_mask = np.ones((B, T), dtype=np.int64)
         user_ids, target_cids = [], []
 
         for row, sample in enumerate(samples):
             user_ids.append(sample['user_id'])
-            target_cids.append([sample['target_cid']])
             seq_cids = sample['input_cids'][-L:]
             start = L - len(seq_cids)
             for offset, cid in enumerate(seq_cids):
                 input_embeds[row, start + offset] = self.embeddings[self.cid2idx[cid]]
                 attention_mask[row, start + offset] = 1
-            target_embeds[row, 0] = self.embeddings[self.cid2idx[sample['target_cid']]]
+            tgt = sample['target_cid']
+            if isinstance(tgt, list):
+                # multi-interest: T positives.
+                target_cids.append(list(tgt))
+                for j, cid in enumerate(tgt[:T]):
+                    target_embeds[row, j] = self.embeddings[self.cid2idx[cid]]
+            else:
+                target_cids.append([tgt])
+                target_embeds[row, 0] = self.embeddings[self.cid2idx[tgt]]
 
         # Per-rank random neg pool (model.all_gather across ranks downstream).
         if self.neg_samples_per_gpu > 0:
@@ -525,7 +566,17 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
     min_history_len = int(d.get('min_history_len', 4))
     seq_label = str(d.get('seq_label', 'seq'))
     positive_label = str(d.get('positive_label', 'pos'))
-    pos_n_for_64d = int(d.get('precomputed_64d_pos_n', 10))
+    # When multi_interest is enabled, eval ground truth must be the SAME
+    # tail-T positives the trainer optimizes against. We therefore prefer
+    # `multi_interest.target_tail_len` over the legacy `precomputed_64d_pos_n`
+    # so train target == eval GT, mirroring V0Simple's 64-d experiment.
+    mi_cfg = d.get('multi_interest', None) or {}
+    mi_enabled = bool(mi_cfg.get('enabled', False))
+    if mi_enabled:
+        pos_n_for_64d = int(mi_cfg.get('target_tail_len',
+                                       d.get('precomputed_64d_pos_n', 10)))
+    else:
+        pos_n_for_64d = int(d.get('precomputed_64d_pos_n', 10))
     eval_users = int(d.get('eval_users', 50000))
     strat = str(d.get('eval_target_strategy', 'all')).lower()
     if strat not in ('all', 'last', 'first'):

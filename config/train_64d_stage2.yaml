@@ -1,0 +1,162 @@
+data:
+  # ===================================================================
+  # 64-d multi-interest training (stage 2: full unfreeze, joint fine-tune).
+  # Inherits the data/eval protocol of stage 1 verbatim so the recall
+  # curves can be concatenated end-to-end. ONLY differences vs stage 1:
+  #   * model.gradient_checkpointing: true (need to grad through Qwen)
+  #   * training.freeze_prefix: removed (user_llm trainable)
+  #   * training.learning_rate: 2e-5 (small, gentle full-trunk fine-tune)
+  #   * training.stage: 3 (ZeRO-3: shard params too, for memory)
+  #   * training.load_pretrained_model: stage-1 best ckpt
+  # ===================================================================
+  dataset_type: v0_aligned
+
+  v0_train_jsonl: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/user_latest/train.jsonl
+  v0_eval_jsonl:  /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/user_latest/test.jsonl
+  v0_embedding_dir: /group/40094/jingweidong/user_sequential_feature_recall/qbfeed_action_flow/preprocessed64d
+
+  seq_label: seq
+  positive_label: pos
+  hard_neg_label: []
+  max_hard_neg: 0
+  min_history_len: 20
+  max_seq_len: 200
+  sample_lastn: true
+  train_target_strategy: random
+  loop_forever: true
+  shuffle_buffer_size: 1024
+
+  multi_interest:
+    enabled: true
+    target_tail_len: 10
+    kmeans_k: 3
+    kmeans_n_iter: 5
+    kmeans_n_init: 1
+
+  eval_users: 50000
+  eval_target_strategy: all
+  eval_seed: 42
+
+  # Stage 2: user_llm trainable. cuBLAS Lt SIGFPE bug requires
+  # train_batch_size <= 4 under ZeRO-3 + bf16-mixed. Launcher overrides
+  # to bs=4*accum=8 -> effective bs=32 per rank.
+  train_batch_size: 4
+  neg_samples_per_gpu: 400
+  neg_pool_size_per_gpu: 1000000
+
+  train_num_workers: 8
+  precomputed_stats_interval: 10000
+
+  precomputed_64d_pos_n: 10
+
+  train_noteinfo_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  engage_lastn_kv: { ip: '', port: '', prefix: '', ex: 1 }
+  click_lastn_data_root: ''
+  item_prompt: '总结:\n'
+  max_text_len: 230
+  max_topic_nums: 8
+  max_input_token_len: 300
+  add_item_hour_embed: false
+  lastn_max_engage_note_num: 0
+  lastn_max_click_note_num_homefeed: 96
+  lastn_max_click_note_num_ads: 0
+
+model:
+  model_name: REDRec
+  item_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  item_llm_init: false
+  user_pretrain_dir: /group/40094/jingweidong/user_sequential_feature_recall/RedSeqRec/eval/pre_trained_ckpts/Qwen2.5-1.5B
+  user_llm_init: true
+  precomputed_input_dim: 64
+  user_output_dim: 64
+  user_final_dim: 64
+  use_ft_flash_attn: true
+  use_lora: false
+  # Stage 2 trains user_llm; activations dominate so grad ckpt is essential.
+  gradient_checkpointing: true
+
+  engage_action_n: 5
+  add_item_action_embed: false
+  add_hour_embed: false
+  add_position_embed: false
+  learnable_interest_query: false
+
+  AE_compress_dim: -1
+  AE_compress_decay_rate: 0.9995
+
+  predict_action: false
+
+  query_nums: 3
+  window_pos: 3
+
+# Stage 2: NO freeze block. user_llm and adapter are jointly trainable.
+
+training:
+  target: homefeed
+  optim_args:
+    # Single LR for both LLM trunk and adapter. 2e-5 is small enough to
+    # gently fine-tune Qwen2.5 without clobbering the pretrained features
+    # but large enough to keep adapter co-adapting after stage 1's lr decay.
+    learning_rate: 2.0e-5
+    weight_decay: 0.01
+
+  scheduler_args:
+    type: cosine
+    # 2000 / 100000 = 2% warmup; matches the post-revision 512-d stage 2
+    # canonical ratio for "first time unfreezing the LLM after adapter warmup".
+    warmup_steps: 2000
+
+  eval_step: 1000
+  eval_interval: 1000
+  eval_user_batch: 128
+  eval_score_chunk: 512
+  save_step: 1000
+  ckpt_keep_top_k: 5
+
+  clip_grad_norm: 1.0
+  accumulation_steps: 1
+  freeze_item: false
+  total_step: 100000
+  strategy: deepspeed
+  # ZeRO Stage 3: shard params + grads + optimizer state. Required for
+  # full Qwen2.5-1.5B fine-tune on H20-96GB at meaningful per-rank batch.
+  stage: 3
+  gradient_checkpointing: true
+
+  # === STAGE-1 CKPT TO LOAD ===
+  # Fill in with the best-recall ckpt from stage 1 before launching:
+  #   <output_dir>/redrec_64d_3query_stage1_<RUN_TS>/checkpoint-<step>/
+  # OR a pre-converted fp32 .bin from utils/zero_to_fp32.py:
+  #   python utils/zero_to_fp32.py <ckpt_dir> <ckpt_dir>/pytorch_model.bin
+  # run.py auto-detects: file path -> torch.load, directory -> deepspeed
+  # zero load.
+  load_pretrained_model: ''
+
+saver:
+  output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  v0_style: true
+  checkpoint_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  log_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
+  saved_model_name: redrec_64d_3query_stage2
+
+eval:
+  target: homefeed
+  model_path: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs/redrec_64d_3query_stage2_<RUN_TS>/checkpoint-100001/
+  note_eval:
+    lastn_note_info_path: ''
+    basepool_note_info_path: ''
+  user_eval:
+    user_lastn_path: eval/user_lastn_my.json
+    max_lastn_len: 200
+    user_eval_batch_size: 16
+
+show_progress: true
+precision: bf16-mixed
+loss: nce
+nce_thres: 0.8
+
+val_only: false
+online_compute_embedding: false
+seed: 1112
+update_interval: 10
+reproducibility: false
