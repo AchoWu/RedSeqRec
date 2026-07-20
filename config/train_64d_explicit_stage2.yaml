@@ -126,6 +126,14 @@ training:
   save_step: 1000
   ckpt_keep_top_k: 5
 
+  # === Full eval diagnostics (same as explicit stage 1 yaml) ===
+  # See config/train_64d_explicit_stage1.yaml for the full explanation.
+  # Enabling both makes each eval take ~5 min (vs ~1 min baseline);
+  # trade-off is you can watch all 5 diagnostic curves + per-category
+  # curve alongside the primary redrec metric in tensorboard.
+  eval_multi_interest_diagnostics: true
+  eval_per_category_retrieval: true
+
   clip_grad_norm: 1.0
   accumulation_steps: 1
   freeze_item: false

@@ -150,6 +150,22 @@ training:
   save_step: 1000
   ckpt_keep_top_k: 5
 
+  # === Full eval diagnostics ===
+  # eval_multi_interest_diagnostics: additionally report redrec_q_mean
+  #   (legacy single-vector path), redrec_q0 / redrec_q1 / redrec_q2
+  #   (each query alone), and redrec_q_best_oracle (oracle upper bound
+  #   that peeks at the ground-truth pos set to pick the winning query
+  #   per user -- NOT deployable, purely diagnostic).
+  # eval_per_category_retrieval: additionally report redrec_per_category,
+  #   where each query only searches its own token's sub-pool. Requires
+  #   data.category_assignment_path to be set (it is, above), otherwise
+  #   silently skipped with a warning.
+  # Together these multiply eval cost by ~6x vs a bare-bones eval; the
+  # extra passes are the primary reason a full eval on 3.08M item pool
+  # takes ~5 min per eval_interval.
+  eval_multi_interest_diagnostics: true
+  eval_per_category_retrieval: true
+
   clip_grad_norm: 1.0
   accumulation_steps: 1
   freeze_item: false
