@@ -487,14 +487,32 @@ def _topk_metrics_local_per_category(
             f'changing model.query_nums.'
         )
 
+    # Move sub_pool_indices to device ONCE at function entry (previously
+    # every ``sub_pool_indices[i].to(device)`` inside the K-per-chunk
+    # inner loop was a no-op when the tensor was already on GPU, but
+    # each call still allocates a lightweight torch.Tensor wrapper on
+    # the host side and dispatches through the device backend). By
+    # keeping references in ``spi_dev`` we do the wrapper allocation
+    # exactly K times per evaluate() call, not K * (U / score_chunk).
+    # evaluate_v0_recall's caller passes GPU tensors here already, so
+    # this is a defensive no-op in the common case and only saves work
+    # when the caller passed CPU tensors.
+    spi_dev = [t.to(device) if t.device != device else t
+               for t in sub_pool_indices]
+
     # Pre-materialise the per-token item_pool sub-slice so we don't
     # re-index item_pool_T on every user chunk. item_pool_T is (D, N)
     # so we index along dim=1 with the token's item indices.
     # Memory: sum over tokens of len(indices) * D * fp32. For the 64-d
     # qbfeed pool: (1.47M + 0.98M + 0.61M) * 64 * 4 = ~800 MB total,
     # which is fine on 96 GB H20 (item_pool_d itself is only ~200 MB).
+    # WARNING: if the pool dimension D grows a lot (e.g. we ever go
+    # back to the 512-d pool while keeping 3 sub-pools), the memory
+    # cost scales linearly with D -- at D=512 the sub-slices sum to
+    # ~6 GB, still safe but worth recomputing before pushing K
+    # further or D wider.
     sub_pools_T = [
-        item_pool_T.index_select(1, sub_pool_indices[i].to(device))
+        item_pool_T.index_select(1, spi_dev[i])
         for i in range(K)
     ]
 
@@ -518,8 +536,9 @@ def _topk_metrics_local_per_category(
             top_i = scores_i.topk(k_i, dim=1)
             cand_scores_list.append(top_i.values)       # (b, k_i)
             # Map local (sub-pool) indices back to global pool indices.
+            # spi_dev[i] was moved to device once at function entry.
             local_idx_i = top_i.indices                 # (b, k_i)
-            global_idx_i = sub_pool_indices[i].to(device)[local_idx_i]
+            global_idx_i = spi_dev[i][local_idx_i]
             cand_global_idx_list.append(global_idx_i)   # (b, k_i)
 
         # Concat candidates from all K tokens -> (b, sum_k) where
