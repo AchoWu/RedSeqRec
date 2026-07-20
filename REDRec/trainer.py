@@ -500,6 +500,12 @@ class Trainer(object):
                 score_chunk=int(self.config.training.get('eval_score_chunk', 512)),
                 ks=ks,
                 eval_baselines=eval_baselines_now,
+                # Opt-in: report q_mean / q_i / q_best_oracle diagnostics
+                # alongside the primary redrec metric. Costs ~5x the redrec
+                # eval time at query_nums=3, so keep off by default.
+                multi_interest_diagnostics=bool(
+                    self.config.training.get('eval_multi_interest_diagnostics', False)
+                ),
             )
         except Exception as e:
             self.logger.error(f'[v0_eval] eval failed at step {self.cur_step}: {e!r}')

@@ -48,7 +48,10 @@ data:
   # This is checked BEFORE the target-tail carve-out, matching V0's
   # build_eval_set_latest gate.
   min_history_len: 20
-  max_seq_len: 200
+  # Aligned with train_64d_stage2.yaml (max_seq_len=100) so the
+  # stage1 -> stage2 recall curve is continuous end-to-end. See the
+  # kmeans stage1 yaml for the full rationale.
+  max_seq_len: 100
   sample_lastn: true
   train_target_strategy: random
   loop_forever: true

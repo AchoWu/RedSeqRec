@@ -28,7 +28,16 @@ data:
   # Users with fewer than 20 valid clicks (after cid filtering) are
   # skipped, keeping a 10-pos margin so input_seq_len >= 10.
   min_history_len: 20
-  max_seq_len: 200
+  # 100 matches stage2 max_seq_len so the two-stage recall curve is
+  # continuous end-to-end (stage2 ckpt inherits the same input-length
+  # attention pattern from stage1). Also aligned with V0Simple 64-d
+  # small-model reference (max_pos_embed=128 -> caps at 100), so cross-
+  # framework recall comparisons stay valid. Qwen2.5-1.5B's positional
+  # embedding is >=32k so 100 truncates the input, not model capacity.
+  # Was 200 before 2026-07; the discrepancy (stage1 200 / stage2 100)
+  # was a source of stage-boundary distribution shift that made the
+  # cross-stage recall curve unreadable.
+  max_seq_len: 100
   sample_lastn: true
   # train_target_strategy is unused when multi_interest is enabled, but we
   # leave the legacy key present so the loader's enum check still passes.

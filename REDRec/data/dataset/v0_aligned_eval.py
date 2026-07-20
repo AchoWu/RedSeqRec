@@ -185,17 +185,20 @@ def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor,
     else:
         emb = emb[:, -1:, :]                              # (B, 1, D)
 
-    # Multi-interest retrieval requires each query slot to be independently
-    # unit-normalized (cosine-comparable to items). This mirrors
-    # ``forward_precomputed_embedding`` where ``output_embs`` is normalised
-    # PER-QUERY before it is fed to the NCE logits, so the queries at eval
-    # time see the same geometry they saw at training time.
-    emb = F.normalize(emb.float(), dim=-1)
-
     if return_multi and emb.size(1) > 1:
-        return emb                                       # (B, K, D)
-    # Legacy path: collapse to a single vector (mean over K queries then
-    # L2-normalize again to keep it on the unit sphere).
+        # Multi-interest retrieval requires each query slot to be
+        # independently unit-normalised (cosine-comparable to items).
+        # This matches ``forward_precomputed_embedding``, where
+        # ``output_embs`` is normalised PER-QUERY before it feeds the
+        # NCE logits, so eval-time queries see the training-time geometry.
+        return F.normalize(emb.float(), dim=-1)              # (B, K, D)
+    # Legacy single-vector path: preserve the pre-2026-07 numerical
+    # semantics -- mean the K query slots first, then L2-normalise the
+    # collapsed vector. Doing per-query normalise BEFORE the mean would
+    # produce a different embedding (equivalent to "mean of unit
+    # vectors" instead of "unit direction of the raw mean") and break
+    # cross-run recall comparability for anyone reading tensorboard
+    # curves that span the code change.
     emb = emb.mean(dim=1)                                # (B, D)
     if emb.dim() == 2:
         emb = F.normalize(emb.float(), dim=-1)
@@ -495,6 +498,7 @@ def evaluate_v0_recall(
     score_chunk: int = 1024,
     ks=(1, 10, 50, 100, 500),
     eval_baselines: bool = True,
+    multi_interest_diagnostics: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate per-user recall@K and hit_rate@K against the full item pool.
 
@@ -743,12 +747,22 @@ def evaluate_v0_recall(
     model.eval()
 
     query_nums_val = int(getattr(base, 'query_nums', 0) or 0)
-    use_multi = query_nums_val > 1
+    # Two levels of "multi-interest":
+    #   * use_multi_forward : model.query_nums > 1, so _redrec_user_emb
+    #     returns a (B, K, D) tensor and the primary redrec metric uses
+    #     the multi-query union max-merge retrieval. Cheap; always on.
+    #   * use_multi_diag    : additionally report the diagnostic
+    #     variants (q_mean / q_i for each i / q_best_oracle). These
+    #     each cost roughly one full retrieval pass, so with K=3 the
+    #     eval budget grows by ~5x vs a single-strategy run. Off by
+    #     default; enabled via training.eval_multi_interest_diagnostics.
+    use_multi_forward = query_nums_val > 1
+    use_multi_diag = use_multi_forward and multi_interest_diagnostics
 
     redrec_acc = _empty_acc()
-    q_mean_acc = _empty_acc() if use_multi else None
-    q_i_accs = [_empty_acc() for _ in range(query_nums_val)] if use_multi else None
-    q_best_acc = _empty_acc() if use_multi else None
+    q_mean_acc = _empty_acc() if use_multi_diag else None
+    q_i_accs = [_empty_acc() for _ in range(query_nums_val)] if use_multi_diag else None
+    q_best_acc = _empty_acc() if use_multi_diag else None
     n_local = idx_local.numel()
     if n_local > 0:
         for s in range(0, n_local, user_batch):
@@ -761,7 +775,7 @@ def evaluate_v0_recall(
             bid_b = bucket_ids_local[s:e]
             vm_b = valid_mask_local_d[s:e]
 
-            if use_multi and ue_multi.dim() == 3:
+            if use_multi_forward and ue_multi.dim() == 3:
                 # ---- primary: max-merge across K queries ----
                 chunk_acc = _topk_metrics_local_multi(
                     ue_multi, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
@@ -769,26 +783,32 @@ def evaluate_v0_recall(
                 )
                 _add_acc(redrec_acc, chunk_acc)
 
-                # ---- diagnostic: q_mean (legacy single-vector path) ----
-                ue_mean = F.normalize(ue_multi.mean(dim=1).float(), dim=-1)
-                _add_acc(q_mean_acc, _topk_metrics_local(
-                    ue_mean, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
-                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
-                ))
-
-                # ---- diagnostic: each individual query alone ----
-                for qi in range(query_nums_val):
-                    _add_acc(q_i_accs[qi], _topk_metrics_local(
-                        ue_multi[:, qi, :].contiguous(),
-                        pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                # ---- diagnostic metrics (only when explicitly enabled) ----
+                # Each of q_mean / q_i / q_best_oracle costs one extra full
+                # retrieval sweep; K=3 diagnostics multiply the redrec eval
+                # cost by ~5. Gate them behind multi_interest_diagnostics so
+                # a baseline training run does not pay the tax.
+                if use_multi_diag:
+                    # ---- q_mean: legacy single-vector path ----
+                    ue_mean = F.normalize(ue_multi.mean(dim=1).float(), dim=-1)
+                    _add_acc(q_mean_acc, _topk_metrics_local(
+                        ue_mean, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
                         ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
                     ))
 
-                # ---- diagnostic: oracle q_best (per-user pick best qi) ----
-                _add_acc(q_best_acc, _topk_metrics_local_qbest(
-                    ue_multi, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
-                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
-                ))
+                    # ---- each individual query alone ----
+                    for qi in range(query_nums_val):
+                        _add_acc(q_i_accs[qi], _topk_metrics_local(
+                            ue_multi[:, qi, :].contiguous(),
+                            pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                            ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                        ))
+
+                    # ---- oracle q_best (per-user pick best qi) ----
+                    _add_acc(q_best_acc, _topk_metrics_local_qbest(
+                        ue_multi, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                        ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                    ))
             else:
                 # Fallback for query_nums <= 1: same as before, single vec.
                 ue = ue_multi if ue_multi.dim() == 2 else ue_multi.squeeze(1)
@@ -797,7 +817,7 @@ def evaluate_v0_recall(
                     ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
                 ))
     results['redrec'] = _reduce_to_metrics(redrec_acc)
-    if use_multi:
+    if use_multi_diag:
         results['redrec_q_mean'] = _reduce_to_metrics(q_mean_acc)
         for qi in range(query_nums_val):
             results[f'redrec_q{qi}'] = _reduce_to_metrics(q_i_accs[qi])
