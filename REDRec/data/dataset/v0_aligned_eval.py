@@ -411,6 +411,175 @@ def _topk_metrics_local_multi(
 
     return out
 
+
+@torch.no_grad()
+def _topk_metrics_local_per_category(
+    user_emb_multi: torch.Tensor,
+    pos_sets_padded: torch.Tensor,
+    pos_sets_lens: torch.Tensor,
+    item_pool_T: torch.Tensor,
+    sub_pool_indices: Sequence[torch.Tensor],
+    bucket_ids: torch.Tensor,
+    n_buckets: int,
+    ks: Sequence[int] = (1, 10, 50, 100, 500),
+    score_chunk: int = 1024,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Per-category retrieval: each query is retrieved from its category's
+    sub-pool ONLY, then per-user we union across all K query heads to
+    produce a single ranked list of items.
+
+    For token i we take user_emb_multi[:, i, :] and score it only against
+    item_pool_T[:, sub_pool_indices[i]]. The per-token max(ks) global-item
+    indices are concatenated across all K tokens (~K * max_k candidates)
+    and deduped; the top max_k by score are then compared against the
+    ground-truth pos set.
+
+    This differs from ``_topk_metrics_local_multi`` (which scores every
+    query against the FULL pool and max-pools per-item across queries)
+    in two ways:
+
+      1. Each query only sees its category's items -- retrieval geometry
+         is strictly disjoint per token. Recall numbers ARE NOT directly
+         comparable to full-pool metrics because each token's search
+         space is smaller (~500k-1.5M vs 3M).
+      2. Union is at the CANDIDATE level, not the score level. If two
+         tokens surface the same item (which is impossible here because
+         sub-pools are disjoint by construction), max-pool would keep
+         it once; concat+dedup would too.
+
+    Best used to answer: "if we could perfectly route each query to the
+    right slice of items, how good is retrieval?" The kmeans-based
+    ``_topk_metrics_local_multi`` answers: "if we let all queries
+    compete over the full pool, how good is retrieval?"
+
+    Args:
+        user_emb_multi   : (U, K, D) float32 already L2-normalised per row.
+        item_pool_T      : (D, N) L2-normalised full item pool transposed.
+        sub_pool_indices : list of K int64 tensors, sub_pool_indices[i]
+                           holds the row-indices into the FULL pool that
+                           belong to token i's category set. Must live
+                           on the same device as user_emb_multi.
+        (other args identical to _topk_metrics_local_multi.)
+    """
+    device = user_emb_multi.device
+    nks = len(ks)
+    out = {
+        'recall_sum_overall':  torch.zeros(nks, dtype=torch.float64, device=device),
+        'hitrate_sum_overall': torch.zeros(nks, dtype=torch.float64, device=device),
+        'valid_count_overall': torch.zeros((), dtype=torch.float64, device=device),
+        'recall_sum_bucket':   torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'hitrate_sum_bucket':  torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'valid_count_bucket':  torch.zeros(n_buckets, dtype=torch.float64, device=device),
+    }
+    if user_emb_multi.numel() == 0:
+        return out
+
+    max_k = max(ks)
+    U, K, D = user_emb_multi.shape
+    # Sanity: sub_pool_indices count must match query count. If it
+    # doesn't, either the eval pack was built without a category
+    # assignment or model query_nums changed after the pack build.
+    if len(sub_pool_indices) != K:
+        raise ValueError(
+            f'per-category eval: got {len(sub_pool_indices)} sub-pools but '
+            f'user_emb has K={K} query heads. Rebuild eval_pack after '
+            f'changing model.query_nums.'
+        )
+
+    # Pre-materialise the per-token item_pool sub-slice so we don't
+    # re-index item_pool_T on every user chunk. item_pool_T is (D, N)
+    # so we index along dim=1 with the token's item indices.
+    # Memory: sum over tokens of len(indices) * D * fp32. For the 64-d
+    # qbfeed pool: (1.47M + 0.98M + 0.61M) * 64 * 4 = ~800 MB total,
+    # which is fine on 96 GB H20 (item_pool_d itself is only ~200 MB).
+    sub_pools_T = [
+        item_pool_T.index_select(1, sub_pool_indices[i].to(device))
+        for i in range(K)
+    ]
+
+    for s in range(0, U, score_chunk):
+        e = min(U, s + score_chunk)
+        b = e - s
+        u = user_emb_multi[s:e].float()                # (b, K, D)
+
+        # Per-token: score b users against token i's sub-pool, take top-max_k.
+        # We collect global item indices (in the FULL pool) per token.
+        cand_scores_list = []      # each: (b, max_k) float32
+        cand_global_idx_list = []  # each: (b, max_k) int64
+        for i in range(K):
+            u_i = u[:, i, :]                            # (b, D)
+            spT_i = sub_pools_T[i]                      # (D, N_i)
+            scores_i = u_i @ spT_i                      # (b, N_i)
+            # If sub_pool is smaller than max_k (extremely unlikely: sub-
+            # pools here are hundreds of thousands, max_k = 500) just
+            # take everything -- topk with k > N would OOB.
+            k_i = min(max_k, scores_i.size(1))
+            top_i = scores_i.topk(k_i, dim=1)
+            cand_scores_list.append(top_i.values)       # (b, k_i)
+            # Map local (sub-pool) indices back to global pool indices.
+            local_idx_i = top_i.indices                 # (b, k_i)
+            global_idx_i = sub_pool_indices[i].to(device)[local_idx_i]
+            cand_global_idx_list.append(global_idx_i)   # (b, k_i)
+
+        # Concat candidates from all K tokens -> (b, sum_k) where
+        # sum_k = K * max_k (or slightly less if a sub-pool was smaller).
+        all_scores = torch.cat(cand_scores_list, dim=1)          # (b, sum_k)
+        all_global_idx = torch.cat(cand_global_idx_list, dim=1)  # (b, sum_k)
+
+        # Take global top max_k across all K sub-pool candidates. Because
+        # sub-pools are DISJOINT by construction (cid_to_token maps each
+        # item to exactly one token), there is no duplication to dedup;
+        # a simple topk over concatenated scores is enough.
+        take = min(max_k, all_scores.size(1))
+        top_final = all_scores.topk(take, dim=1)
+        topk_idx_in_cat = top_final.indices                       # (b, take)
+        # gather to translate positions-in-concat into global item indices
+        topk = torch.gather(all_global_idx, 1, topk_idx_in_cat)   # (b, take)
+        # Pad to max_k if take < max_k (very edge case; put an invalid
+        # sentinel that never matches a valid pos row -1 becomes -1).
+        if take < max_k:
+            pad = torch.full((b, max_k - take), -1,
+                              dtype=topk.dtype, device=device)
+            topk = torch.cat([topk, pad], dim=1)
+
+        pos_b = pos_sets_padded[s:e]
+        pos_len_b = pos_sets_lens[s:e].to(torch.float64)
+        bid_b = bucket_ids[s:e]
+        if valid_mask is not None:
+            vm_b = valid_mask[s:e]
+        else:
+            vm_b = torch.ones(b, dtype=torch.bool, device=device)
+        vm_b = vm_b & (pos_len_b > 0)
+
+        match = topk.unsqueeze(-1).eq(pos_b.unsqueeze(1))     # (b, max_k, P_max)
+        for ki, k in enumerate(ks):
+            top_k = match[:, :k, :]
+            hit_per_pos = top_k.any(dim=1)
+            n_hit = hit_per_pos.to(torch.float64).sum(dim=1)
+            recall_u = n_hit / pos_len_b.clamp_min(1.0)
+            hit_u = (n_hit > 0).to(torch.float64)
+            valid_f = vm_b.to(torch.float64)
+            recall_u = recall_u * valid_f
+            hit_u = hit_u * valid_f
+
+            out['recall_sum_overall'][ki] += recall_u.sum()
+            out['hitrate_sum_overall'][ki] += hit_u.sum()
+            for bid in range(n_buckets):
+                sel = (bid_b == bid) & vm_b
+                if sel.any():
+                    out['recall_sum_bucket'][bid, ki] += recall_u[sel].sum()
+                    out['hitrate_sum_bucket'][bid, ki] += hit_u[sel].sum()
+
+        out['valid_count_overall'] += vm_b.to(torch.float64).sum()
+        for bid in range(n_buckets):
+            sel = (bid_b == bid) & vm_b
+            if sel.any():
+                out['valid_count_bucket'][bid] += sel.to(torch.float64).sum()
+
+    return out
+
+
 @torch.no_grad()
 def _topk_metrics_local_qbest(
     user_emb_multi: torch.Tensor,
@@ -506,6 +675,7 @@ def evaluate_v0_recall(
     ks=(1, 10, 50, 100, 500),
     eval_baselines: bool = True,
     multi_interest_diagnostics: bool = False,
+    per_category_retrieval: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """Evaluate per-user recall@K and hit_rate@K against the full item pool.
 
@@ -763,13 +933,42 @@ def evaluate_v0_recall(
     #     each cost roughly one full retrieval pass, so with K=3 the
     #     eval budget grows by ~5x vs a single-strategy run. Off by
     #     default; enabled via training.eval_multi_interest_diagnostics.
+    #   * use_per_category  : report per-category retrieval (each
+    #     query only searches its category's sub-pool). Requires
+    #     eval_pack to have sub_pool_item_indices (set by
+    #     build_v0_eval_pack when data.category_assignment_path is
+    #     configured). Off by default; enabled via
+    #     training.eval_per_category_retrieval.
     use_multi_forward = query_nums_val > 1
     use_multi_diag = use_multi_forward and multi_interest_diagnostics
+    use_per_category = (
+        use_multi_forward
+        and per_category_retrieval
+        and eval_pack.get('sub_pool_item_indices', None) is not None
+    )
+    if per_category_retrieval and not use_per_category:
+        logger = getLogger()
+        logger.warning(
+            '[v0_eval] per_category_retrieval=True but eval_pack has no '
+            'sub_pool_item_indices (data.category_assignment_path not set '
+            'in yaml, or query_nums<=1). Skipping per-category metric.'
+        )
 
     redrec_acc = _empty_acc()
     q_mean_acc = _empty_acc() if use_multi_diag else None
     q_i_accs = [_empty_acc() for _ in range(query_nums_val)] if use_multi_diag else None
     q_best_acc = _empty_acc() if use_multi_diag else None
+    per_cat_acc = _empty_acc() if use_per_category else None
+
+    # Materialise sub_pool_indices as GPU int64 tensors ONCE (avoid re-
+    # transfer on every chunk).
+    if use_per_category:
+        sub_pool_indices_gpu = [
+            torch.as_tensor(idx, dtype=torch.long, device=device)
+            for idx in eval_pack['sub_pool_item_indices']
+        ]
+    else:
+        sub_pool_indices_gpu = None
     n_local = idx_local.numel()
     if n_local > 0:
         for s in range(0, n_local, user_batch):
@@ -816,6 +1015,20 @@ def evaluate_v0_recall(
                         ue_multi, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
                         ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
                     ))
+
+                # ---- per-category retrieval (independent of use_multi_diag) ----
+                # Cost: K sub-pool cosine passes (each ~1/3 the full-pool
+                # cost since sub-pools sum to ~= pool). Net roughly 1x
+                # baseline redrec cost. Gated behind
+                # training.eval_per_category_retrieval so runs that don't
+                # care about the category-aware metric don't pay it.
+                if use_per_category:
+                    _add_acc(per_cat_acc, _topk_metrics_local_per_category(
+                        ue_multi, pos_b, plen_b, item_pool_T,
+                        sub_pool_indices_gpu,
+                        bid_b, n_buckets,
+                        ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                    ))
             else:
                 # Fallback for query_nums <= 1: same as before, single vec.
                 ue = ue_multi if ue_multi.dim() == 2 else ue_multi.squeeze(1)
@@ -835,6 +1048,13 @@ def evaluate_v0_recall(
         # this obvious in tensorboard / logs -- previous name was too
         # easy to misread as "the best a routing policy could get".
         results['redrec_q_best_oracle'] = _reduce_to_metrics(q_best_acc)
+    if use_per_category:
+        # Recall numbers reported under this key are NOT directly
+        # comparable to `redrec` (which searches the full pool) because
+        # each token's search space is only its category's items. Read
+        # this as: "if we had a perfect router sending each query to
+        # exactly its category, how good is retrieval?"
+        results['redrec_per_category'] = _reduce_to_metrics(per_cat_acc)
 
     # ---- zero-param baselines ----
     # Aligned with the v0 reference run:

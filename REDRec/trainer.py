@@ -506,6 +506,15 @@ class Trainer(object):
                 multi_interest_diagnostics=bool(
                     self.config.training.get('eval_multi_interest_diagnostics', False)
                 ),
+                # Opt-in: report per-category retrieval (each query only
+                # searches its category's sub-pool). Requires
+                # data.category_assignment_path in the yaml so that
+                # build_v0_eval_pack materialised sub_pool_item_indices.
+                # Costs ~1x baseline redrec eval time (K sub-pool passes
+                # roughly summing to the full-pool cost).
+                per_category_retrieval=bool(
+                    self.config.training.get('eval_per_category_retrieval', False)
+                ),
             )
         except Exception as e:
             self.logger.error(f'[v0_eval] eval failed at step {self.cur_step}: {e!r}')

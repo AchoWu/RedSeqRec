@@ -853,7 +853,7 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
     # Memmap-backed embeddings share OS page cache across all 8 ranks
     # (~6.7 GB total, not 53 GB), and L2-normalization is deferred to
     # evaluate_v0_recall where it runs once on the GPU.
-    return {
+    pack = {
         'seq_cid_idx': seq_cid_idx_t,
         'mask': mask_t,
         'hist_lens': hist_lens_t,
@@ -862,3 +862,45 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
         'embed_dim': int(embeddings.shape[1]),
         'num_items': int(embeddings.shape[0]),
     }
+
+    # -------- optional: per-category sub-pool indices --------
+    # When data.category_assignment_path is set, we also emit a list of
+    # numpy int64 arrays -- one per token -- containing the row indices
+    # into `embeddings_ref` that belong to each token's category set.
+    # evaluate_v0_recall uses these to run per-category retrieval:
+    # token_i's query embedding scores ONLY against sub_pool_item_indices[i]
+    # items, so each query is retrieved from its semantically-aligned
+    # slice of the pool.
+    #
+    # Unlabeled items (cid_to_token == -1) intentionally go into NO
+    # sub-pool -- they don't appear in any per-category retrieval result.
+    # This mirrors the training-side lazy filter which also drops them.
+    cat_path = d.get('category_assignment_path', None)
+    if cat_path:
+        cid_to_token = np.load(cat_path, mmap_mode='r')
+        if cid_to_token.shape != (pack['num_items'],):
+            raise ValueError(
+                f'category_assignment_path shape {cid_to_token.shape} does '
+                f'not match embedding pool ({pack["num_items"]},); the '
+                f'lookup was produced against a different memmap.'
+            )
+        cid_to_token = np.asarray(cid_to_token)  # materialise (~3 MB)
+        # np.where per token is O(N) but N=3M and this runs once at
+        # pack build time; negligible next to the outer eval loop.
+        n_tokens = int(cid_to_token.max()) + 1  # tokens are 0..n_tokens-1
+        sub_pool_item_indices = [
+            np.where(cid_to_token == t)[0].astype(np.int64, copy=False)
+            for t in range(n_tokens)
+        ]
+        pack['sub_pool_item_indices'] = sub_pool_item_indices
+        pack['n_tokens'] = n_tokens
+        logger.info(
+            f'[v0_eval] per-category sub-pools built: '
+            + ', '.join(
+                f'token_{i}={len(sub_pool_item_indices[i]):,}'
+                for i in range(n_tokens)
+            )
+            + f' (unlabeled {int((cid_to_token == -1).sum()):,} excluded)'
+        )
+
+    return pack
