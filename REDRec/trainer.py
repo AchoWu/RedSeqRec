@@ -124,6 +124,35 @@ class Trainer(object):
         for n, p in self.model.named_parameters():
             self.logger.info(f"{n} {p.size()} {p.requires_grad}")
 
+        # Print the multi-interest matching mode on rank 0 so it appears
+        # prominently at the top of every nohup.out. The mode is derived
+        # from the SAME yaml keys the dataloader/model check, so this
+        # log line is authoritative -- if it says "explicit" the model
+        # forward will actually use gather(target_token_ids), not
+        # kmeans + Hungarian.
+        if self.rank == 0:
+            cat_path = config.data.get('category_assignment_path', None) if hasattr(config, 'data') else None
+            multi_cfg = (config.data.get('multi_interest', None) or {}) if hasattr(config, 'data') else {}
+            mi_enabled = bool(multi_cfg.get('enabled', False)) or (
+                str(config.data.get('train_target_strategy', '')).lower() == 'multi'
+                if hasattr(config, 'data') else False
+            )
+            if cat_path:
+                mode = 'explicit (category-to-token gather)'
+                detail = f'category_assignment_path={cat_path}'
+            elif mi_enabled:
+                mode = 'kmeans (cluster_based_matching + Hungarian)'
+                detail = f'multi_interest.enabled=true, no category_assignment_path'
+            else:
+                mode = 'single-target (query_nums<=1, no multi-interest)'
+                detail = 'multi_interest.enabled=false'
+            query_nums = int(getattr(self.model, 'query_nums', 0) or 0)
+            self.logger.info(
+                f'[MODE] multi-interest matching = {mode}\n'
+                f'[MODE]   {detail}\n'
+                f'[MODE]   model.query_nums = {query_nums}'
+            )
+
         print(f'>>> rank: {torch.distributed.get_rank()} init done')
 
     def _freeze_params(self, freeze_prefix):
