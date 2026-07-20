@@ -185,20 +185,27 @@ def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor,
     else:
         emb = emb[:, -1:, :]                              # (B, 1, D)
 
+    # Per-query L2-normalise BEFORE the (optional) mean-across-queries
+    # collapse. Rationale:
+    #   * forward_precomputed_embedding normalises output_embs per-query
+    #     (redrec.py line ~537) BEFORE feeding NCE logits and gather.
+    #     Training therefore optimises the model on unit-length per-query
+    #     directions, not on the raw pre-normalise output.
+    #   * compute_user_embedding (deployment path) does the same
+    #     per-query normalise (redrec.py line ~795) before flattening.
+    #   * If eval collapsed via a raw mean and then normalised the
+    #     result, cosine retrieval would score against a geometry the
+    #     model was never optimised for.
+    # This does change the eval numerics vs. any pre-2026-07 legacy
+    # curve (the mean-then-normalise geometry differs from
+    # normalise-then-mean-then-normalise), but the ALIGNED geometry is
+    # what the training objective actually optimises, so we use it.
+    emb = F.normalize(emb.float(), dim=-1)
+
     if return_multi and emb.size(1) > 1:
-        # Multi-interest retrieval requires each query slot to be
-        # independently unit-normalised (cosine-comparable to items).
-        # This matches ``forward_precomputed_embedding``, where
-        # ``output_embs`` is normalised PER-QUERY before it feeds the
-        # NCE logits, so eval-time queries see the training-time geometry.
-        return F.normalize(emb.float(), dim=-1)              # (B, K, D)
-    # Legacy single-vector path: preserve the pre-2026-07 numerical
-    # semantics -- mean the K query slots first, then L2-normalise the
-    # collapsed vector. Doing per-query normalise BEFORE the mean would
-    # produce a different embedding (equivalent to "mean of unit
-    # vectors" instead of "unit direction of the raw mean") and break
-    # cross-run recall comparability for anyone reading tensorboard
-    # curves that span the code change.
+        return emb                                       # (B, K, D)
+    # Legacy single-vector path: collapse K queries via mean then
+    # re-normalise back onto the unit sphere.
     emb = emb.mean(dim=1)                                # (B, D)
     if emb.dim() == 2:
         emb = F.normalize(emb.float(), dim=-1)
