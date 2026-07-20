@@ -190,12 +190,29 @@ class Trainer(object):
         self.model.train()
         total_loss = 0
         if self.rank == 0:
+            # Write the tqdm progress bar to STDERR (not stdout). Reasons:
+            #   1. Logger output goes to stdout via StreamHandler. If both go to
+            #      stdout, tqdm's '\r' bar overwrites the previous logger line
+            #      AND vice versa, producing the garbled "step 0 jumped to step
+            #      1000" effect we saw before.
+            #   2. With ``nohup ... > nohup.out 2>&1``, stderr is merged into
+            #      the same file but written without buffering, so each refresh
+            #      lands as a separate '\r' record that ``tail`` can collapse
+            #      cleanly.
+            # Also: keep ``mininterval`` reasonable so the bar actually advances
+            # in the log file (default 0.1s is fine for our >=1s/step pace).
             pbar = tqdm(
                 total=self.total_step,
+                initial=self.cur_step,
                 miniters=self.update_interval,
+                mininterval=1.0,
                 desc=set_color(f"Step [{self.cur_step}/{self.total_step}]", 'pink'),
-                file=sys.stdout
+                file=sys.stderr,
+                dynamic_ncols=True,
+                leave=True,
             )
+        else:
+            pbar = None
         bwd_time = t.time()
         
         # Get accumulation steps from config or use default value 1
@@ -244,8 +261,24 @@ class Trainer(object):
                 bwd_time = t.time()
                 elapse = t.time() - start_time
 
-                
-                if show_progress and self.rank == 0 and batch_idx % self.update_interval == 0:
+                # Advance the progress bar exactly once per OPTIMIZER step.
+                # (Originally there was no pbar.update() call at all, so the
+                # bar was stuck at "Step [0/N] 0%" for the whole run.)
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_description(
+                        set_color(f"Step [{self.cur_step}/{self.total_step}]", 'pink')
+                    )
+
+                # Per-step text log. Trigger by ``cur_step``, NOT ``batch_idx``:
+                # with gradient accumulation enabled (accum=K), step-completion
+                # always lands on ``batch_idx == K*step - 1``, which is coprime
+                # with most ``update_interval`` choices and therefore *never*
+                # satisfies ``batch_idx % update_interval == 0``. That's why we
+                # saw zero step-level logs for the first 1000 steps in the
+                # earlier nohup.out -- the message was guarded by an impossible
+                # condition. Use cur_step for a deterministic cadence.
+                if show_progress and self.rank == 0 and (self.cur_step % self.update_interval == 0):
                     cur_step_lr = self.lr_scheduler.get_lr()[0]
                     nce_samples = model_out['nce_samples']
                     nce_top1_acc = model_out['nce_top1_acc']

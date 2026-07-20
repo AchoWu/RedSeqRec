@@ -114,7 +114,8 @@ def _last_n_pool(seq_emb: torch.Tensor, mask: torch.Tensor, n: int) -> torch.Ten
 
 
 @torch.no_grad()
-def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor,
+                    return_multi: bool = True) -> torch.Tensor:
     """Run the REDRec user tower forward to produce the per-user embedding.
 
     Mirrors the user-side path of ``model.forward_precomputed_embedding``::
@@ -127,9 +128,17 @@ def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor) -> torch.
         user_emb   = user_emb[:, -query_nums:]                          # take query slot
         user_emb   = L2-normalize(user_emb, dim=-1)
 
-    For query_nums == 1 the result is (B, 1, D) -> we squeeze to (B, D).
-    For query_nums > 1 we take the mean over the query slots (matches the
-    ``cluster_based_matching`` degenerate case when target_num=1).
+    Args:
+        return_multi: if True and query_nums > 1, return the per-query
+            embeddings (B, K, D) with each row L2-normalized; the eval
+            uses this to run 3-query union max-merge retrieval that is
+            aligned with the multi-interest V0Simple protocol
+            (``_run_eval_per_user_latest``). If False, mean-pool over
+            the K query slots to produce (B, D) -- the legacy behaviour,
+            kept for the diagnostic ``redrec_q_mean`` strategy.
+
+    For query_nums == 1 the result is (B, 1, D) -> squeeze to (B, D)
+    regardless of return_multi.
 
     The base RedRec module is resolved via attribute access on whatever
     wrapper (Fabric / DeepSpeed) ``model`` currently is. We rely on Fabric's
@@ -172,11 +181,24 @@ def _redrec_user_emb(model, seq_emb: torch.Tensor, mask: torch.Tensor) -> torch.
     if hasattr(base, 'output_mlp'):
         emb = base.output_mlp(emb)
     if base.query_nums > 0:
-        emb = emb[:, -base.query_nums:, :]
+        emb = emb[:, -base.query_nums:, :]                # (B, K, D)
     else:
-        emb = emb[:, -1:, :]
-    # query_nums >= 1: mean over query slots (degenerates to identity for q=1).
-    emb = emb.mean(dim=1)
+        emb = emb[:, -1:, :]                              # (B, 1, D)
+
+    # Multi-interest retrieval requires each query slot to be independently
+    # unit-normalized (cosine-comparable to items). This mirrors
+    # ``forward_precomputed_embedding`` where ``output_embs`` is normalised
+    # PER-QUERY before it is fed to the NCE logits, so the queries at eval
+    # time see the same geometry they saw at training time.
+    emb = F.normalize(emb.float(), dim=-1)
+
+    if return_multi and emb.size(1) > 1:
+        return emb                                       # (B, K, D)
+    # Legacy path: collapse to a single vector (mean over K queries then
+    # L2-normalize again to keep it on the unit sphere).
+    emb = emb.mean(dim=1)                                # (B, D)
+    if emb.dim() == 2:
+        emb = F.normalize(emb.float(), dim=-1)
     return emb
 
 
@@ -288,6 +310,179 @@ def _topk_metrics_local(
 
     return out
 
+@torch.no_grad()
+def _topk_metrics_local_multi(
+    user_emb_multi: torch.Tensor,
+    pos_sets_padded: torch.Tensor,
+    pos_sets_lens: torch.Tensor,
+    item_pool_T: torch.Tensor,
+    bucket_ids: torch.Tensor,
+    n_buckets: int,
+    ks: Sequence[int] = (1, 10, 50, 100, 500),
+    score_chunk: int = 1024,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Multi-interest per-user top-K recall + hit_rate against the full pool.
+
+    For each user we have K query vectors; each query is scored against
+    the whole pool, then we max-pool across queries at the item level
+    ("union" retrieval) and finally take the global top-max(ks). This
+    matches V0Simple's ``_multi_retrieve_union_topk`` (see
+    ``v0_simple/trainer.py``) which is the correct evaluation protocol
+    for a multi-interest tower whose loss picks the best-matching query
+    per target (Hungarian / cluster_based_matching).
+
+    Args:
+        user_emb_multi : (U, K, D) float32 already L2-normalized per row.
+        item_pool_T    : (D, N)    L2-normalized item pool transposed.
+        (other args identical to _topk_metrics_local)
+
+    Returns dict with SUM tensors identical in schema to
+    ``_topk_metrics_local``. Reduction across ranks and division by
+    valid users still happens in evaluate_v0_recall.
+    """
+    device = user_emb_multi.device
+    nks = len(ks)
+    out = {
+        'recall_sum_overall':  torch.zeros(nks, dtype=torch.float64, device=device),
+        'hitrate_sum_overall': torch.zeros(nks, dtype=torch.float64, device=device),
+        'valid_count_overall': torch.zeros((), dtype=torch.float64, device=device),
+        'recall_sum_bucket':   torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'hitrate_sum_bucket':  torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'valid_count_bucket':  torch.zeros(n_buckets, dtype=torch.float64, device=device),
+    }
+    if user_emb_multi.numel() == 0:
+        return out
+
+    max_k = max(ks)
+    U = user_emb_multi.size(0)
+
+    for s in range(0, U, score_chunk):
+        e = min(U, s + score_chunk)
+        u = user_emb_multi[s:e].float()                # (b, K, D)
+        # (b, K, N) -> per-item max across K queries -> (b, N)
+        scores = torch.einsum('bkd,dn->bkn', u, item_pool_T)
+        scores_max, _ = scores.max(dim=1)              # (b, N)
+        topk = scores_max.topk(max_k, dim=1).indices   # (b, max_k)
+
+        pos_b = pos_sets_padded[s:e]
+        pos_len_b = pos_sets_lens[s:e].to(torch.float64)
+        bid_b = bucket_ids[s:e]
+        if valid_mask is not None:
+            vm_b = valid_mask[s:e]
+        else:
+            vm_b = torch.ones(e - s, dtype=torch.bool, device=device)
+        vm_b = vm_b & (pos_len_b > 0)
+
+        match = topk.unsqueeze(-1).eq(pos_b.unsqueeze(1))     # (b, max_k, P_max)
+        for ki, k in enumerate(ks):
+            top_k = match[:, :k, :]
+            hit_per_pos = top_k.any(dim=1)
+            n_hit = hit_per_pos.to(torch.float64).sum(dim=1)
+            recall_u = n_hit / pos_len_b.clamp_min(1.0)
+            hit_u = (n_hit > 0).to(torch.float64)
+            valid_f = vm_b.to(torch.float64)
+            recall_u = recall_u * valid_f
+            hit_u = hit_u * valid_f
+
+            out['recall_sum_overall'][ki] += recall_u.sum()
+            out['hitrate_sum_overall'][ki] += hit_u.sum()
+            for bid in range(n_buckets):
+                sel = (bid_b == bid) & vm_b
+                if sel.any():
+                    out['recall_sum_bucket'][bid, ki] += recall_u[sel].sum()
+                    out['hitrate_sum_bucket'][bid, ki] += hit_u[sel].sum()
+
+        out['valid_count_overall'] += vm_b.to(torch.float64).sum()
+        for bid in range(n_buckets):
+            sel = (bid_b == bid) & vm_b
+            if sel.any():
+                out['valid_count_bucket'][bid] += sel.to(torch.float64).sum()
+
+    return out
+
+@torch.no_grad()
+def _topk_metrics_local_qbest(
+    user_emb_multi: torch.Tensor,
+    pos_sets_padded: torch.Tensor,
+    pos_sets_lens: torch.Tensor,
+    item_pool_T: torch.Tensor,
+    bucket_ids: torch.Tensor,
+    n_buckets: int,
+    ks: Sequence[int] = (1, 10, 50, 100, 500),
+    score_chunk: int = 1024,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Oracle upper bound: for each user, at each k, pick the SINGLE query
+    whose own top-k list gives the highest recall_u (ties broken by first
+    query). This is NOT deployable (uses ground truth to select the head)
+    but tells us the ceiling of a per-user router that always picks the
+    right head. Comparing q_best - redrec (union) tells us how much we
+    still leave on the table by union-max-merging blindly.
+    """
+    device = user_emb_multi.device
+    nks = len(ks)
+    out = {
+        'recall_sum_overall':  torch.zeros(nks, dtype=torch.float64, device=device),
+        'hitrate_sum_overall': torch.zeros(nks, dtype=torch.float64, device=device),
+        'valid_count_overall': torch.zeros((), dtype=torch.float64, device=device),
+        'recall_sum_bucket':   torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'hitrate_sum_bucket':  torch.zeros((n_buckets, nks), dtype=torch.float64, device=device),
+        'valid_count_bucket':  torch.zeros(n_buckets, dtype=torch.float64, device=device),
+    }
+    if user_emb_multi.numel() == 0:
+        return out
+
+    max_k = max(ks)
+    U = user_emb_multi.size(0)
+    K = user_emb_multi.size(1)
+
+    for s in range(0, U, score_chunk):
+        e = min(U, s + score_chunk)
+        u = user_emb_multi[s:e].float()                # (b, K, D)
+        # (b, K, N)
+        scores = torch.einsum('bkd,dn->bkn', u, item_pool_T)
+        # (b, K, max_k) each query's own top-max_k
+        topk_per_q = scores.topk(max_k, dim=2).indices
+
+        pos_b = pos_sets_padded[s:e]
+        pos_len_b = pos_sets_lens[s:e].to(torch.float64)
+        bid_b = bucket_ids[s:e]
+        if valid_mask is not None:
+            vm_b = valid_mask[s:e]
+        else:
+            vm_b = torch.ones(e - s, dtype=torch.bool, device=device)
+        vm_b = vm_b & (pos_len_b > 0)
+
+        # (b, K, max_k, P_max) match
+        match = topk_per_q.unsqueeze(-1).eq(pos_b.unsqueeze(1).unsqueeze(1))
+        for ki, k in enumerate(ks):
+            top_k = match[:, :, :k, :]                       # (b, K, k, P_max)
+            hit_per_pos_q = top_k.any(dim=2)                 # (b, K, P_max)
+            n_hit_q = hit_per_pos_q.to(torch.float64).sum(dim=2)  # (b, K)
+            # For each user pick the query with the highest n_hit at this k.
+            n_hit_best, _ = n_hit_q.max(dim=1)               # (b,)
+            recall_u = n_hit_best / pos_len_b.clamp_min(1.0)
+            hit_u = (n_hit_best > 0).to(torch.float64)
+            valid_f = vm_b.to(torch.float64)
+            recall_u = recall_u * valid_f
+            hit_u = hit_u * valid_f
+
+            out['recall_sum_overall'][ki] += recall_u.sum()
+            out['hitrate_sum_overall'][ki] += hit_u.sum()
+            for bid in range(n_buckets):
+                sel = (bid_b == bid) & vm_b
+                if sel.any():
+                    out['recall_sum_bucket'][bid, ki] += recall_u[sel].sum()
+                    out['hitrate_sum_bucket'][bid, ki] += hit_u[sel].sum()
+
+        out['valid_count_overall'] += vm_b.to(torch.float64).sum()
+        for bid in range(n_buckets):
+            sel = (bid_b == bid) & vm_b
+            if sel.any():
+                out['valid_count_bucket'][bid] += sel.to(torch.float64).sum()
+
+    return out
 
 @torch.no_grad()
 def evaluate_v0_recall(
@@ -521,7 +716,21 @@ def evaluate_v0_recall(
         for k_ in dst:
             dst[k_] = dst[k_] + src[k_]
 
-    # ---- redrec strategy ----
+    # ---- redrec strategy (multi-interest max-merge across K queries) ----
+    # Aligned with the V0Simple ``_run_eval_per_user_latest`` protocol:
+    # each of the K queries is scored against the full item pool, then per
+    # item we take max score across queries, and only then take the global
+    # top-max(ks). This is the correct multi-interest retrieval formula
+    # and is the ONLY reason the same 3-query tower can look 30-40%
+    # better on r@500 than the old (mean-collapse -> single-vector) path.
+    #
+    # We also emit diagnostic side channels so we can tell whether the 3
+    # queries have actually diverged into separate interests:
+    #   redrec_q_mean : legacy single-vector path (mean over K then topK)
+    #   redrec_q{i}   : query i alone retrieves the top-max(ks)
+    #   redrec_q_best : oracle upper bound -- for each user pick the qi
+    #                   with the highest per-user recall@max(ks)
+    #                   (not deployable, purely diagnostic)
     model_was_training = False
     base = model
     for attr in ('module', '_forward_module', '_original_module'):
@@ -533,24 +742,66 @@ def evaluate_v0_recall(
         model_was_training = True
     model.eval()
 
+    query_nums_val = int(getattr(base, 'query_nums', 0) or 0)
+    use_multi = query_nums_val > 1
+
     redrec_acc = _empty_acc()
+    q_mean_acc = _empty_acc() if use_multi else None
+    q_i_accs = [_empty_acc() for _ in range(query_nums_val)] if use_multi else None
+    q_best_acc = _empty_acc() if use_multi else None
     n_local = idx_local.numel()
     if n_local > 0:
         for s in range(0, n_local, user_batch):
             e = min(n_local, s + user_batch)
             sl = idx_local[s:e]
             seq_b, mask_b = _gather_seq_batch(sl)
-            ue = _redrec_user_emb(model, seq_b, mask_b)
+            ue_multi = _redrec_user_emb(model, seq_b, mask_b, return_multi=True)
             pos_b = pos_padded_local[s:e]
             plen_b = pos_lens_local[s:e]
             bid_b = bucket_ids_local[s:e]
             vm_b = valid_mask_local_d[s:e]
-            chunk_acc = _topk_metrics_local(
-                ue, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
-                ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
-            )
-            _add_acc(redrec_acc, chunk_acc)
+
+            if use_multi and ue_multi.dim() == 3:
+                # ---- primary: max-merge across K queries ----
+                chunk_acc = _topk_metrics_local_multi(
+                    ue_multi, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                )
+                _add_acc(redrec_acc, chunk_acc)
+
+                # ---- diagnostic: q_mean (legacy single-vector path) ----
+                ue_mean = F.normalize(ue_multi.mean(dim=1).float(), dim=-1)
+                _add_acc(q_mean_acc, _topk_metrics_local(
+                    ue_mean, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
+
+                # ---- diagnostic: each individual query alone ----
+                for qi in range(query_nums_val):
+                    _add_acc(q_i_accs[qi], _topk_metrics_local(
+                        ue_multi[:, qi, :].contiguous(),
+                        pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                        ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                    ))
+
+                # ---- diagnostic: oracle q_best (per-user pick best qi) ----
+                _add_acc(q_best_acc, _topk_metrics_local_qbest(
+                    ue_multi, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
+            else:
+                # Fallback for query_nums <= 1: same as before, single vec.
+                ue = ue_multi if ue_multi.dim() == 2 else ue_multi.squeeze(1)
+                _add_acc(redrec_acc, _topk_metrics_local(
+                    ue, pos_b, plen_b, item_pool_T, bid_b, n_buckets,
+                    ks=ks, score_chunk=score_chunk, valid_mask=vm_b,
+                ))
     results['redrec'] = _reduce_to_metrics(redrec_acc)
+    if use_multi:
+        results['redrec_q_mean'] = _reduce_to_metrics(q_mean_acc)
+        for qi in range(query_nums_val):
+            results[f'redrec_q{qi}'] = _reduce_to_metrics(q_i_accs[qi])
+        results['redrec_q_best'] = _reduce_to_metrics(q_best_acc)
 
     # ---- zero-param baselines ----
     # Aligned with the v0 reference run:

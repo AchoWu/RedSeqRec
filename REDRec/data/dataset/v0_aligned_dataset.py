@@ -343,7 +343,20 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
             elif self.hard_neg_labels and label in self.hard_neg_labels:
                 hard_neg_items.append(cid)
 
-        if len(seq_items) < self.min_history_len or not pos_items:
+        if not pos_items:
+            return None, None, None
+        # V0Simple-aligned gate: total clicks (input + GT) >= min_history_len.
+        # Earlier we required ``len(seq_items) >= min_history_len`` which
+        # raised the bar to "input >= min_history_len" (and therefore "total
+        # clicks >= min_history_len + |pos|"), making us drop ~11% of users
+        # whose total clicks were 20..29. V0's build_eval_set_latest checks
+        # ``len(kept) >= 20`` BEFORE carving out the tail-T, so we mirror
+        # that here for train/eval consistency.
+        if (len(seq_items) + len(pos_items)) < self.min_history_len:
+            return None, None, None
+        if not seq_items:
+            # Need at least 1 input item; otherwise the user_llm sees an
+            # all-padded sequence which is not a useful training example.
             return None, None, None
 
         L = self.max_seq_len
@@ -659,13 +672,28 @@ def build_v0_eval_pack(config, embeddings, cid_index, logger=None):
                     elif label == positive_label:
                         pos_cids.append(cid)
 
-                if len(seq_cids) < min_history_len or not pos_cids:
+                # V0Simple-aligned gating: require
+                #   total clicks (input + GT) >= min_history_len, AND input >= 1.
+                # Here ``seq_cids`` is the input part (history minus the tail-T
+                # positives, since normalize_history_record already split them);
+                # ``pos_cids`` is the GT part. Earlier we required
+                # ``len(seq_cids) >= min_history_len`` which raised the bar to
+                # "total clicks >= min_history_len + T", dropping ~11% of users
+                # whose input length was 10..19. V0Simple's
+                # ``build_eval_set_latest`` checks ``len(kept) >= 20`` BEFORE
+                # carving out the tail-T, so a user with 25 total clicks (15
+                # input + 10 GT) is kept by V0 but was dropped by us. Match V0.
+                if not pos_cids or not seq_cids:
+                    skipped += 1
+                    continue
+                if (len(seq_cids) + len(pos_cids)) < min_history_len:
                     skipped += 1
                     continue
                 # Track raw (pre-truncation) history length for length-bucket stats;
                 # the bucketization should reflect "user activity", not the model's
-                # context window.
-                full_hist_len = len(seq_cids)
+                # context window. Use total clicks (input + GT) so the bucket
+                # definition matches V0's "kept" length convention.
+                full_hist_len = len(seq_cids) + len(pos_cids)
                 if len(seq_cids) > L:
                     seq_cids = seq_cids[-L:]
 

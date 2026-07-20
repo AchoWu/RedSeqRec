@@ -20,7 +20,12 @@ data:
   hard_neg_label: []
   max_hard_neg: 0
   min_history_len: 20
-  max_seq_len: 200
+  # Aligned with V0Simple's small-model 64-d run (max_seq_len=100). The
+  # small model uses max_pos_embed=128 so it caps the input at 100; we
+  # match that exactly so recall numbers are directly comparable.
+  # Qwen2.5-1.5B's positional embedding is >=32k so this only truncates
+  # the input, not the model capacity.
+  max_seq_len: 100
   sample_lastn: true
   train_target_strategy: random
   loop_forever: true

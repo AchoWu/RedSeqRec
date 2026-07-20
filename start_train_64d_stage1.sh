@@ -29,12 +29,16 @@ RUN_PY="run.py"
 NPROC_PER_NODE=8
 MASTER_PORT=16672
 
-# Stage 1 has user_llm frozen so the cuBLAS Lt SIGFPE bug (which only
-# triggers under ZeRO-3 + bf16-mixed at micro-batch >= 8) does NOT
-# apply here: we're on ZeRO-2. Default per-rank micro-batch = 8,
-# accumulation = 1.
-train_batch_size=8
-accumulation_steps=1
+# cuBLAS Lt bf16 batched matmul SIGFPE: empirically reproduces on this
+# host (PyTorch 2.3 / cuBLAS 12.4) at micro-batch >= 8, INDEPENDENT of
+# DeepSpeed ZeRO stage. We previously thought it was ZeRO-3-only and
+# defaulted stage 1 to bs=8 / accum=1; that crashed on the very first
+# Qwen forward (Fatal Python error: Floating point exception, all 8
+# ranks). The safe ceiling is bs=4. We compensate with accum=8 to keep
+# effective per-rank batch = 32, matching the stage-2 launcher and the
+# legacy 64-d single-stage launcher.
+train_batch_size=4
+accumulation_steps=8
 
 # Optional: SANITY_STEPS=N caps total_step / eval_interval / save_step
 # for a quick smoke test. Tensorboard / log path is unaffected.

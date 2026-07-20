@@ -55,12 +55,13 @@ data:
   eval_seed: 42
 
   # ---- batch / negatives ----
-  # Stage 1 freezes user_llm (no LLM grad/optim state). We can afford a
-  # larger per-rank micro-batch. But cuBLAS Lt SIGFPE bug also applies
-  # here: launcher overrides train_batch_size/accumulation_steps to
-  # bs=4*accum=8 (effective bs=32 per rank) when needed; default below
-  # is bs=8 to match V0Simple's effective bs/rank when LLM is frozen.
-  train_batch_size: 8
+  # Stage 1 freezes user_llm (no LLM grad/optim state). One might assume
+  # that lets us safely raise per-rank micro-batch -- DON'T. The cuBLAS
+  # Lt bf16 batched matmul SIGFPE bug fires at micro-batch >= 8 on this
+  # host regardless of ZeRO stage (verified: ZeRO-2 + bs=8 also crashes
+  # in Qwen attention's q_proj on the first forward). Hard ceiling is
+  # bs=4; the launcher pairs it with accum=8 -> effective bs/rank = 32.
+  train_batch_size: 4
   neg_samples_per_gpu: 400
   neg_pool_size_per_gpu: 1000000
 
