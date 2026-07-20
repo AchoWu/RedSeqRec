@@ -1,0 +1,40 @@
+{
+  "_comment": "Category-to-token assignment for explicit multi-interest training on the 64-d qbfeed_action_flow item pool. Semantic clarity prioritized over balance -- the item pool naturally skews toward entertainment (~48%), and forcing 1/3 balance requires cross-semantic moves that make the tokens hard to interpret. We accept the 48/32/20 skew instead.",
+  "_source": "Derived from category_stats.py output on 3,080,187-item pool (10,125 unlabeled dropped -> 3,070,062 labeled).",
+  "_generated": "2026-07-20 manual assignment. Small-tail categories (<=200 items each) are backfilled to the semantically closest bucket (剧情长尾 -> token_1, 摄影/星座/壁纸 -> token_2, 历史朝代 -> token_3).",
+  "_totals": {
+    "labeled_items": 3070062,
+    "unlabeled_items_dropped": 10125,
+    "categories_covered": 55,
+    "categories_dropped": 0,
+    "distribution": {
+      "token_1": {"items": 1475662, "share": 0.4807, "label": "娱乐观赏"},
+      "token_2": {"items": 984952, "share": 0.3208, "label": "生活起居"},
+      "token_3": {"items": 609448, "share": 0.1985, "label": "社会知识"}
+    },
+    "_note_on_imbalance": "token_3 at 19.85% is smaller than a uniform 33% partition. Training signal per token will scale with pool share, so token_3 will train slower than token_1/2, but it will still receive gradient every step from users whose pos items land in this bucket. This is preferable to muddling semantics: PMs / analysts can read 'this token is the user's affinity for X' for each of the three tokens."
+  },
+  "_semantics": {
+    "token_1": "娱乐观赏 -- 明星影视 + 短视频消遣 + 剧情文学 (娱乐/电视剧/电影/综艺/网红达人/音乐/美女/搞笑/动漫/剧情类长尾).",
+    "token_2": "生活起居 -- 衣食住行 + 家庭 + 生活兴趣活动 (生活/美食/宠物/育儿/健康/时尚/情感/体育/游戏/旅游).",
+    "token_3": "社会知识 -- 社会时事资讯 + 科普学习 (社会/时事/军事/汽车/财经/房产/三农/科技/科学/历史/文化/教育/纪录片/职场)."
+  },
+  "token_1_categories": [
+    "娱乐", "电视剧", "电影", "综艺", "网红达人", "音乐",
+    "美女", "搞笑", "动漫", "心灵鸡汤",
+    "漫剧", "曲艺", "短剧", "小说",
+    "广告创意", "婚恋情缘", "都市强者", "都市日常", "年代",
+    "架空", "古言穿越", "灵异惊悚", "传统古言", "都市修仙",
+    "马甲", "神豪", "豪门总裁"
+  ],
+  "token_2_categories": [
+    "生活", "美食", "宠物", "育儿", "健康", "时尚", "情感",
+    "体育", "游戏", "旅游",
+    "摄影", "星座命理", "壁纸头像"
+  ],
+  "token_3_categories": [
+    "社会", "时事", "军事", "汽车", "财经", "房产", "三农",
+    "科技", "科学", "历史", "文化", "教育", "纪录片",
+    "职场", "历史朝代"
+  ]
+}
