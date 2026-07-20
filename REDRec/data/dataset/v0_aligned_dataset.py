@@ -369,12 +369,22 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
           `target_tail_len`, taken from the LAST T positives of the user.
         Returns (None, None, None) when the user fails the gating check.
 
-        When self.explicit_multi_interest is True, we ALSO drop any item
-        whose cid_to_token value is -1 ("unlabeled" -- CSV row was missing
-        the first-level category, ~0.33% of the pool). Rationale: with
-        explicit assignment we need every training item to have a token,
-        and mask-based loss handling for a 0.33% slice adds complexity for
-        no meaningful benefit.
+        Filtering order (matters for explicit_multi_interest):
+          1. cid_index membership filter  -- items whose cid is not in the
+             memmap pool are dropped. This is symmetric between explicit
+             and kmeans paths: neither path can use an unrecognizable cid.
+          2. min_history_len gate         -- uses the POST-index-filter but
+             PRE-explicit-filter counts, so users with tail unlabeled items
+             (~0.33% of pool) don't get demoted below the gate just because
+             they used the wrong content. This keeps the training user
+             population identical between explicit and kmeans runs, so
+             recall A/B tests measure the training method, not a
+             population shift.
+          3. explicit unlabeled filter    -- drops unlabeled items from
+             seq_items / pos_items so downstream _build_batch never has
+             to emit a target_token_id of -1.
+          4. target_tail_len check        -- LABELED pos count must fill T
+             slots (multi-interest mode only).
         """
         seq_items, pos_items, hard_neg_items = [], [], []
         for it in history:
@@ -384,13 +394,6 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
             cid = str(cid)
             if cid not in self.cid2idx:
                 continue
-            # Lazy filter: skip unlabeled items when explicit mode is on.
-            # cid_to_token is only queried here (one lookup per history
-            # item, negligible cost vs the embedding fetch downstream).
-            if self.explicit_multi_interest:
-                idx = self.cid2idx[cid]
-                if int(self.cid_to_token[idx]) < 0:
-                    continue
             label = it.get('label')
             if label == self.seq_label:
                 seq_items.append(cid)
@@ -402,18 +405,37 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         if not pos_items:
             return None, None, None
         # V0Simple-aligned gate: total clicks (input + GT) >= min_history_len.
-        # Earlier we required ``len(seq_items) >= min_history_len`` which
-        # raised the bar to "input >= min_history_len" (and therefore "total
-        # clicks >= min_history_len + |pos|"), making us drop ~11% of users
-        # whose total clicks were 20..29. V0's build_eval_set_latest checks
-        # ``len(kept) >= 20`` BEFORE carving out the tail-T, so we mirror
-        # that here for train/eval consistency.
+        # Applied BEFORE the explicit unlabeled filter so the gate operates
+        # on the same click count the kmeans path sees. Users with 25 total
+        # clicks (3 of which happen to be unlabeled) still pass the >=20
+        # gate here; the 3 unlabeled items are dropped only in the next
+        # block. Without this ordering, explicit runs would silently
+        # exclude ~1% of borderline users the kmeans path keeps, biasing
+        # any train/eval A/B comparison.
         if (len(seq_items) + len(pos_items)) < self.min_history_len:
             return None, None, None
         if not seq_items:
             # Need at least 1 input item; otherwise the user_llm sees an
             # all-padded sequence which is not a useful training example.
             return None, None, None
+
+        # Explicit-mode lazy filter (after the gate).
+        # cid_to_token is memmap-opened; one indexed read per remaining
+        # history item, ~O(hist_len) with negligible overhead.
+        if self.explicit_multi_interest:
+            seq_items = [
+                c for c in seq_items
+                if int(self.cid_to_token[self.cid2idx[c]]) >= 0
+            ]
+            pos_items = [
+                c for c in pos_items
+                if int(self.cid_to_token[self.cid2idx[c]]) >= 0
+            ]
+            # Note: the filter can now produce ``seq_items == []`` even
+            # after the gate passed (unlikely: would require a user whose
+            # entire pool-matched history is unlabeled). Guard again.
+            if not pos_items or not seq_items:
+                return None, None, None
 
         L = self.max_seq_len
         if len(seq_items) > L:
@@ -424,7 +446,11 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         if self.multi_interest_enabled:
             T = self.target_tail_len
             if len(pos_items) < T:
-                # Not enough positives to fill the (B, T, D) target tensor.
+                # Not enough LABELED positives to fill the (B, T, D)
+                # target tensor. In explicit mode this can happen when a
+                # user has T total pos items but some are unlabeled and
+                # were filtered above; in kmeans mode it means the user
+                # simply doesn't have T pos items at all.
                 return None, None, None
             target = pos_items[-T:]
         else:
@@ -461,10 +487,14 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         attention_mask = np.zeros((B, L), dtype=np.int64)
         target_embeds = np.zeros((B, T, D), dtype=np.float32)
         target_mask = np.ones((B, T), dtype=np.int64)
-        # target_token_ids[b, j] = 0..n_tokens-1, one token per target pos.
-        # Only populated when explicit_multi_interest is True; else stays
-        # as an all-zero placeholder that model-side simply ignores.
-        target_token_ids = np.zeros((B, T), dtype=np.int64)
+        # target_token_ids[b, j] = 0..Q-1, one token per target pos.
+        # Initialised to -1 as a sentinel; the value only becomes a valid
+        # token index in the explicit-multi-interest branch below. If any
+        # downstream consumer accidentally reads target_token_ids on a
+        # non-explicit batch (or on a padded slot when we start allowing
+        # pos < T in the future), the -1 will fail the model-side bounds
+        # check instead of silently steering every padded pos to token_0.
+        target_token_ids = np.full((B, T), -1, dtype=np.int64)
         user_ids, target_cids = [], []
 
         for row, sample in enumerate(samples):

@@ -183,6 +183,10 @@ class REDRec(BaseModel):
         self.config = config
         self._parse_config(config)
         self._build_model()
+        # First-batch check flag for the explicit-token-id branch: we only
+        # want to verify max(token_ids) < query_nums once per training run
+        # (the check requires a GPU->CPU sync and is redundant after batch 1).
+        self._explicit_token_id_bounds_checked = False
 
     def _parse_config(self, config):
         mcfg = config.model
@@ -556,10 +560,29 @@ class REDRec(BaseModel):
                 B_ = output_embs.size(0)
                 T_ = token_ids.size(1)
                 D_ = output_embs.size(-1)
-                # Defensive clamp so a corrupt/oversized id can't index-out-of-
-                # bounds. In normal operation dataloader already guarantees
-                # 0 <= id < Q, so this is a no-op fast path.
-                token_ids = token_ids.clamp_(min=0, max=output_embs.size(1) - 1)
+                # One-time bounds check: yaml's model.query_nums and the
+                # cid_to_token.npy referenced by data.category_assignment_path
+                # are produced by two different processes; when they disagree
+                # (e.g. yaml Q=2 but cid_to_token contains id=2 for the
+                # 社会知识 group), gathering with an oversized id is either
+                # (a) silently clamped down and semantics scramble, or (b)
+                # crashes deep inside CUDA with no useful traceback.
+                # We surface the mismatch with a clear Python-level error on
+                # the first batch and skip the check on all subsequent
+                # batches (it requires a GPU->CPU sync each call).
+                if not self._explicit_token_id_bounds_checked:
+                    max_id = int(token_ids.max().item())
+                    min_id = int(token_ids.min().item())
+                    Q = output_embs.size(1)
+                    if not (0 <= min_id and max_id < Q):
+                        raise ValueError(
+                            f'precomputed_target_token_ids out of range for '
+                            f'query_nums={Q}: observed min={min_id} max={max_id}. '
+                            f'Check that yaml model.query_nums matches the '
+                            f'number of token_N_categories entries in the '
+                            f'JSON referenced by data.category_assignment_path.'
+                        )
+                    self._explicit_token_id_bounds_checked = True
                 gather_idx = token_ids.unsqueeze(-1).expand(B_, T_, D_)
                 matched_output_embs = output_embs.gather(1, gather_idx)
             elif output_embs.size(1) == target_emb64.size(1):

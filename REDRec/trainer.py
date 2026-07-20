@@ -73,7 +73,17 @@ class Trainer(object):
             from tensorboardX import SummaryWriter
             self.tensorboad_writer = SummaryWriter(tensorboard_base_root)
 
-        self.update_interval = config.get("update_interval", 5)
+        self.update_interval = int(config.get("update_interval", 5))
+        # Guard against a yaml typo that sets update_interval: 0 -- the
+        # step-log branch below uses (self.cur_step % self.update_interval)
+        # and would raise ZeroDivisionError on the first optimizer step.
+        # We accept 1 (log every step) as the minimum meaningful value.
+        if self.update_interval < 1:
+            raise ValueError(
+                f'config.update_interval must be a positive integer '
+                f'(got {self.update_interval}). Use 1 to log every step; '
+                f'default is 5.'
+            )
 
         self.cur_step = 0
         self.total_step = config.training.get('total_step', 200000)

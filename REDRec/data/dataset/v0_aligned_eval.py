@@ -726,11 +726,11 @@ def evaluate_v0_recall(
     #
     # We also emit diagnostic side channels so we can tell whether the 3
     # queries have actually diverged into separate interests:
-    #   redrec_q_mean : legacy single-vector path (mean over K then topK)
-    #   redrec_q{i}   : query i alone retrieves the top-max(ks)
-    #   redrec_q_best : oracle upper bound -- for each user pick the qi
-    #                   with the highest per-user recall@max(ks)
-    #                   (not deployable, purely diagnostic)
+    #   redrec_q_mean        : legacy single-vector path (mean over K then topK)
+    #   redrec_q{i}          : query i alone retrieves the top-max(ks)
+    #   redrec_q_best_oracle : oracle upper bound -- for each user pick the qi
+    #                          with the highest per-user recall@max(ks)
+    #                          (NOT deployable, purely diagnostic)
     model_was_training = False
     base = model
     for attr in ('module', '_forward_module', '_original_module'):
@@ -801,7 +801,13 @@ def evaluate_v0_recall(
         results['redrec_q_mean'] = _reduce_to_metrics(q_mean_acc)
         for qi in range(query_nums_val):
             results[f'redrec_q{qi}'] = _reduce_to_metrics(q_i_accs[qi])
-        results['redrec_q_best'] = _reduce_to_metrics(q_best_acc)
+        # NOTE: this metric peeks at the ground-truth pos set to pick the
+        # winning query for every user, so it is an ORACLE upper bound
+        # rather than something a live retrieval system can achieve.
+        # Renamed from 'redrec_q_best' to 'redrec_q_best_oracle' to make
+        # this obvious in tensorboard / logs -- previous name was too
+        # easy to misread as "the best a routing policy could get".
+        results['redrec_q_best_oracle'] = _reduce_to_metrics(q_best_acc)
 
     # ---- zero-param baselines ----
     # Aligned with the v0 reference run:
