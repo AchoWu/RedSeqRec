@@ -294,6 +294,47 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         self.embed_dim = int(embeddings.shape[1])
         self.num_items = int(embeddings.shape[0])
 
+        # ---- explicit multi-interest: category-to-token lookup ----
+        # If category_assignment_path is set (points at a cid_to_token.npy
+        # produced by build_cid_to_token.py), we enable EXPLICIT assignment
+        # instead of the model-side kmeans+Hungarian path. Effects:
+        #   * _select_window drops pos/seq items whose token is -1
+        #     (unlabeled items in the CSV); the model never sees them.
+        #   * _build_batch emits an extra tensor `precomputed_target_token_ids`
+        #     of shape [B, T] with values in {0, 1, ..., n_tokens-1}, one
+        #     token idx per target pos. The model uses these to gather the
+        #     matching interest-token embedding directly, skipping the
+        #     kmeans+linear_sum_assignment CPU roundtrip entirely.
+        #
+        # The array is memmap-opened (mode='r'): ~3 MB fits happily in the
+        # OS page cache and is shared across all DataLoader workers and DDP
+        # ranks on the same host.
+        cat_path = d.get('category_assignment_path', None)
+        if cat_path:
+            if not os.path.isfile(cat_path):
+                raise FileNotFoundError(
+                    f'category_assignment_path is set but the file does not '
+                    f'exist: {cat_path}. Generate it with build_cid_to_token.py.'
+                )
+            self.cid_to_token = np.load(cat_path, mmap_mode='r')
+            if self.cid_to_token.shape != (self.num_items,):
+                raise ValueError(
+                    f'cid_to_token shape {self.cid_to_token.shape} does not '
+                    f'match embedding pool ({self.num_items},). The lookup '
+                    f'was produced against a different memmap; regenerate.'
+                )
+            self.explicit_multi_interest = True
+            n_labeled = int((np.asarray(self.cid_to_token) != -1).sum())
+            self.logger.info(
+                f'[v0_aligned] explicit multi-interest enabled; loaded '
+                f'{cat_path} shape={self.cid_to_token.shape} '
+                f'labeled={n_labeled:,}/{self.num_items:,} '
+                f'({n_labeled / max(1, self.num_items):.2%})'
+            )
+        else:
+            self.cid_to_token = None
+            self.explicit_multi_interest = False
+
         self.logger.info(
             f'[v0_aligned rank={self.global_rank}/{self.world_size}] '
             f'jsonl={self.train_jsonl} max_seq_len={self.max_seq_len} '
@@ -301,7 +342,8 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
             f'hard_neg_labels={sorted(self.hard_neg_labels)} max_hard_neg={self.max_hard_neg} '
             f'shuffle_buf={self.shuffle_buffer_size} bs={self.train_batch_size} '
             f'neg_per_gpu={self.neg_samples_per_gpu} '
-            f'embed: num={self.num_items} dim={self.embed_dim}'
+            f'embed: num={self.num_items} dim={self.embed_dim} '
+            f'explicit_mi={self.explicit_multi_interest}'
         )
 
     @staticmethod
@@ -326,6 +368,13 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         In multi-interest mode: target_cid_or_list is a `list[str]` of length
           `target_tail_len`, taken from the LAST T positives of the user.
         Returns (None, None, None) when the user fails the gating check.
+
+        When self.explicit_multi_interest is True, we ALSO drop any item
+        whose cid_to_token value is -1 ("unlabeled" -- CSV row was missing
+        the first-level category, ~0.33% of the pool). Rationale: with
+        explicit assignment we need every training item to have a token,
+        and mask-based loss handling for a 0.33% slice adds complexity for
+        no meaningful benefit.
         """
         seq_items, pos_items, hard_neg_items = [], [], []
         for it in history:
@@ -335,6 +384,13 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
             cid = str(cid)
             if cid not in self.cid2idx:
                 continue
+            # Lazy filter: skip unlabeled items when explicit mode is on.
+            # cid_to_token is only queried here (one lookup per history
+            # item, negligible cost vs the embedding fetch downstream).
+            if self.explicit_multi_interest:
+                idx = self.cid2idx[cid]
+                if int(self.cid_to_token[idx]) < 0:
+                    continue
             label = it.get('label')
             if label == self.seq_label:
                 seq_items.append(cid)
@@ -405,6 +461,10 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         attention_mask = np.zeros((B, L), dtype=np.int64)
         target_embeds = np.zeros((B, T, D), dtype=np.float32)
         target_mask = np.ones((B, T), dtype=np.int64)
+        # target_token_ids[b, j] = 0..n_tokens-1, one token per target pos.
+        # Only populated when explicit_multi_interest is True; else stays
+        # as an all-zero placeholder that model-side simply ignores.
+        target_token_ids = np.zeros((B, T), dtype=np.int64)
         user_ids, target_cids = [], []
 
         for row, sample in enumerate(samples):
@@ -419,10 +479,18 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
                 # multi-interest: T positives.
                 target_cids.append(list(tgt))
                 for j, cid in enumerate(tgt[:T]):
-                    target_embeds[row, j] = self.embeddings[self.cid2idx[cid]]
+                    idx = self.cid2idx[cid]
+                    target_embeds[row, j] = self.embeddings[idx]
+                    if self.explicit_multi_interest:
+                        # cid was already required non-unlabeled by
+                        # _select_window, so this is guaranteed >= 0.
+                        target_token_ids[row, j] = int(self.cid_to_token[idx])
             else:
                 target_cids.append([tgt])
-                target_embeds[row, 0] = self.embeddings[self.cid2idx[tgt]]
+                idx = self.cid2idx[tgt]
+                target_embeds[row, 0] = self.embeddings[idx]
+                if self.explicit_multi_interest:
+                    target_token_ids[row, 0] = int(self.cid_to_token[idx])
 
         # Per-rank random neg pool (model.all_gather across ranks downstream).
         if self.neg_samples_per_gpu > 0:
@@ -433,7 +501,7 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
         else:
             neg_embeds = np.zeros((0, D), dtype=np.float32)
 
-        return {
+        batch = {
             'precomputed_input_embeds': torch.from_numpy(input_embeds),
             'precomputed_attention_mask': torch.from_numpy(attention_mask),
             'precomputed_target_embeds': torch.from_numpy(target_embeds),
@@ -442,6 +510,9 @@ class REDRecV0AlignedDataset(torch.utils.data.IterableDataset):
             'user_ids': user_ids,
             'target_cids': target_cids,
         }
+        if self.explicit_multi_interest:
+            batch['precomputed_target_token_ids'] = torch.from_numpy(target_token_ids)
+        return batch
 
     # ---- iteration with V0-style reservoir shuffle buffer ----
     def _generate(self, worker_id, num_workers):

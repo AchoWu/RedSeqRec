@@ -539,12 +539,39 @@ class REDRec(BaseModel):
         neg_emb64 = neg_emb64 / neg_emb64.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
         if self.query_nums > 0:
-            # Fast path: when query_nums == target_num (typical case query_nums=1, target_num=1),
-            # cluster_based_matching degenerates to identity (linear_sum_assignment on 1x1 etc.).
-            # Skip the per-sample CPU call to avoid GPU<->CPU sync overhead.
-            if output_embs.size(1) == target_emb64.size(1):
+            # Explicit multi-interest fast path (preferred when available):
+            # dataloader ships precomputed_target_token_ids [B, T] telling us
+            # which of the Q learnable interest tokens each target pos should
+            # be matched against. Given output_embs [B, Q, D_out] and token
+            # ids [B, T], gather at dim=1 to produce matched embeddings
+            # [B, T, D_out] where matched[b, t] = output_embs[b, token_ids[b, t]].
+            # This skips the kmeans + linear_sum_assignment CPU roundtrip in
+            # cluster_based_matching entirely, and gives every pos a stable
+            # (dataloader-declared) token assignment across steps -- token
+            # semantics no longer depend on batch content.
+            explicit_ids = interaction.get('precomputed_target_token_ids', None)
+            if explicit_ids is not None:
+                # target_token_ids: [B, T] int64 on cpu; move to device once.
+                token_ids = explicit_ids.to(output_embs.device, dtype=torch.long)
+                B_ = output_embs.size(0)
+                T_ = token_ids.size(1)
+                D_ = output_embs.size(-1)
+                # Defensive clamp so a corrupt/oversized id can't index-out-of-
+                # bounds. In normal operation dataloader already guarantees
+                # 0 <= id < Q, so this is a no-op fast path.
+                token_ids = token_ids.clamp_(min=0, max=output_embs.size(1) - 1)
+                gather_idx = token_ids.unsqueeze(-1).expand(B_, T_, D_)
+                matched_output_embs = output_embs.gather(1, gather_idx)
+            elif output_embs.size(1) == target_emb64.size(1):
+                # Legacy fast path: query_nums == target_num (typical case
+                # query_nums=1, target_num=1); cluster_based_matching would
+                # degenerate to identity on a 1x1 assignment, so skip the
+                # per-sample CPU call to avoid GPU<->CPU sync overhead.
                 matched_output_embs = output_embs
             else:
+                # Legacy kmeans + Hungarian path (multi-interest without an
+                # explicit category assignment). Kept for backward compat with
+                # runs that don't set data.category_assignment_path.
                 matched_output_embs = cluster_based_matching(target_emb64, output_embs)
         else:
             matched_output_embs = output_embs[:, -target_num:]
