@@ -1,17 +1,18 @@
 #!/bin/bash
 
 # Usage:
-#   STAGE1_CKPT=<path> bash start_train_64d_explicit_stage2.sh                          # 8 GPU full run
-#   DEBUG=1 STAGE1_CKPT=<path> bash start_train_64d_explicit_stage2.sh                  # 1 GPU sanity
-#   DEBUG=1 SANITY_STEPS=200 STAGE1_CKPT=<path> bash start_train_64d_explicit_stage2.sh # 200 steps
-#   SANITY_STEPS=500 STAGE1_CKPT=<path> bash start_train_64d_explicit_stage2.sh         # 8 GPU, 500 steps
+#   bash start_train_64d_explicit_stage2.sh                          # 8 GPU full run, uses yaml default STAGE1_CKPT
+#   STAGE1_CKPT=<path> bash start_train_64d_explicit_stage2.sh       # override yaml default
+#   DEBUG=1 bash start_train_64d_explicit_stage2.sh                  # 1 GPU sanity
+#   DEBUG=1 SANITY_STEPS=200 bash start_train_64d_explicit_stage2.sh # 200 steps
+#   SANITY_STEPS=500 bash start_train_64d_explicit_stage2.sh         # 8 GPU, 500 steps
 #
-# STAGE1_CKPT MUST be the best-recall ckpt from the EXPLICIT stage 1 run
-# (redrec_64d_explicit_stage1_<TS>/checkpoint-<step>/). Do NOT load a
-# kmeans stage-1 ckpt here: explicit token semantics (token_0=娱乐,
-# token_1=生活, token_2=社会) do not align with a kmeans-trained
-# ckpt's interest queries, which would force the LLM to re-align
-# tokens from scratch in stage 2.
+# STAGE1_CKPT (optional) overrides training.load_pretrained_model from
+# the yaml. It MUST point at an EXPLICIT stage 1 ckpt if set -- do NOT
+# load a kmeans stage-1 ckpt here: explicit token semantics (token_0=
+# 娱乐, token_1=生活, token_2=社会) do not align with a kmeans-trained
+# ckpt's interest queries, which would force the LLM to re-align tokens
+# from scratch in stage 2.
 #
 # STAGE1_CKPT can be a DeepSpeed ZeRO checkpoint directory or a
 # pre-converted fp32 .bin (run.py auto-detects).
@@ -43,22 +44,18 @@ MASTER_PORT=16675
 train_batch_size=4
 accumulation_steps=8
 
-# Required: stage-1 ckpt path. Allow override via STAGE1_CKPT env var.
-if [[ -z "${STAGE1_CKPT:-}" ]]; then
-    cat <<EOF >&2
-[stage2-explicit] ERROR: STAGE1_CKPT env var is required. Examples:
-    export STAGE1_CKPT=/apdcephfs_gy4/.../redrec_64d_explicit_stage1_<TS>/checkpoint-<step>
-    # OR (faster cold-start):
-    export STAGE1_CKPT=/apdcephfs_gy4/.../redrec_64d_explicit_stage1_<TS>/checkpoint-<step>/pytorch_model.bin
-    bash start_train_64d_explicit_stage2.sh
-Note: STAGE1_CKPT MUST come from an EXPLICIT stage-1 run, not a kmeans
-one. Explicit / kmeans stage-1 ckpts have differently-oriented interest
-query embeddings; mixing them here defeats the point of stage 1.
-EOF
-    exit 1
+# Optional: stage-1 ckpt path via STAGE1_CKPT env var. If unset, the
+# yaml default (config/train_64d_explicit_stage2.yaml
+# training.load_pretrained_model) is used -- currently pinned at the
+# checkpoint-97001 fp32 .bin from run 20260721_114156. Set STAGE1_CKPT
+# to override the yaml default for one-off experiments.
+if [[ -n "${STAGE1_CKPT:-}" ]]; then
+    echo "[stage2-explicit] STAGE1_CKPT override: ${STAGE1_CKPT}"
+    EXTRA_ARGS=( --training.load_pretrained_model "${STAGE1_CKPT}" )
+else
+    echo "[stage2-explicit] STAGE1_CKPT unset -> using yaml default (training.load_pretrained_model)"
+    EXTRA_ARGS=()
 fi
-
-EXTRA_ARGS=( --training.load_pretrained_model "${STAGE1_CKPT}" )
 
 if [[ -n "${SANITY_STEPS:-}" ]]; then
     echo "[stage2-explicit] SANITY mode: capping total_step / eval_interval / save_step to ${SANITY_STEPS}"
