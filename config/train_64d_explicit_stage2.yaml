@@ -145,14 +145,22 @@ training:
   gradient_checkpointing: true
 
   # === EXPLICIT STAGE-1 CKPT TO LOAD ===
-  # Fill in with the best-recall ckpt from the explicit stage-1 run
-  # (redrec_64d_explicit_stage1_<RUN_TS>/checkpoint-<step>/), OR its
-  # pre-converted fp32 .bin (utils/zero_to_fp32.py). IMPORTANT: do
-  # NOT load from a kmeans stage-1 ckpt -- explicit token semantics
-  # (token_0=娱乐, token_1=生活, token_2=社会) would land on
+  # Best-recall ckpt from explicit stage-1 run 20260721_114156 (100k
+  # steps, redrec r@500 plateaued at 0.0394 from step ~79k onward).
+  # checkpoint-97001 is the latest top-5 ckpt at that plateau -- LR is
+  # nearly fully cosine-annealed by then so the weights are the most
+  # stable representative of the plateau. Pre-converted to a single
+  # fp32 .bin via utils/zero_to_fp32.py to drop cold-start load from
+  # ~25 min (ZeRO shard directory) to ~13 min.
+  # IMPORTANT: do NOT load from a kmeans stage-1 ckpt -- explicit token
+  # semantics (token_0=娱乐, token_1=生活, token_2=社会) would land on
   # randomly-oriented query embeddings from that run, forcing the LLM
   # to re-align interest tokens from scratch in stage 2.
-  load_pretrained_model: ''
+  # The launcher (start_train_64d_explicit_stage2.sh) still passes
+  # STAGE1_CKPT env var on the command line and will override this
+  # value; the yaml default is here so a bare `python run.py --config
+  # train_64d_explicit_stage2.yaml` also picks the right ckpt.
+  load_pretrained_model: '/apdcephfs_gy4/share_303218624/jingweidong/output_xhs/redrec_64d_explicit_stage1_20260721_114156/checkpoint-97001/pytorch_model.bin'
 
 saver:
   output_dir: /apdcephfs_gy4/share_303218624/jingweidong/output_xhs
